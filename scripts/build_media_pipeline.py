@@ -53,9 +53,9 @@ def request_with_retry(
     url: str,
     *,
     context: str,
-    attempts: int = 4,
+    attempts: int = 3,
     backoff_seconds: float = 2.0,
-    retryable_status_codes: tuple[int, ...] = (408, 425, 429, 500, 502, 503, 504),
+    expected_status_codes: tuple[int, ...] = (200,),
     **kwargs: Any,
 ) -> requests.Response:
     last_error: Exception | None = None
@@ -63,18 +63,16 @@ def request_with_retry(
     for attempt in range(1, attempts + 1):
         try:
             response = requests.request(method, url, **kwargs)
-            if response.status_code in retryable_status_codes:
-                details = response.text[:300].strip()
-                raise RuntimeError(f"{context} returned retryable status {response.status_code}: {details}")
-            raise_for_status_with_hint(response, context)
+            if response.status_code not in expected_status_codes:
+                details = response.text[:800].strip()
+                raise RuntimeError(
+                    f"{context} returned unexpected status {response.status_code}. "
+                    f"Expected {expected_status_codes}. Response: {details}"
+                )
             return response
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             last_error = exc
-        except requests.HTTPError:
-            raise
         except RuntimeError as exc:
-            if "retryable status" not in str(exc):
-                raise
             last_error = exc
 
         if attempt == attempts:
@@ -89,7 +87,7 @@ def request_with_retry(
 
 def download_file(url: str, output_path: Path) -> None:
     ensure_parent(output_path)
-    response = request_with_retry("GET", url, context="File download", stream=True, timeout=60, attempts=4, backoff_seconds=2.0)
+    response = request_with_retry("GET", url, context="File download", stream=True, timeout=60, attempts=3, backoff_seconds=2.0)
     with output_path.open("wb") as file_obj:
         for chunk in response.iter_content(chunk_size=8192):
             if chunk:
@@ -160,7 +158,7 @@ def generate_image(asset: dict[str, Any], provider: dict[str, Any], output_root:
         context=f"Image generation ({asset['id']})",
         headers=headers,
         json=payload,
-        timeout=120,
+        timeout=300,
         attempts=3,
         backoff_seconds=3.0,
     )
@@ -228,15 +226,8 @@ def poll_video_task(provider: dict[str, Any], task_id: str) -> dict[str, Any]:
     status_url = f"{provider['status_endpoint_base'].rstrip('/')}/{task_id}"
 
     for _ in range(180):
-        response = request_with_retry(
-            "GET",
-            status_url,
-            context=f"Video task polling ({task_id})",
-            headers=headers,
-            timeout=30,
-            attempts=4,
-            backoff_seconds=2.0,
-        )
+        response = requests.request("GET", status_url, headers=headers, timeout=30)
+        raise_for_status_with_hint(response, f"Video task polling ({task_id})")
         body = response.json()
         status = body.get("status")
         if status == "succeeded":
@@ -273,25 +264,36 @@ def generate_video(asset: dict[str, Any], provider: dict[str, Any], output_root:
         "Authorization": f"Bearer {ensure_api_key()}",
     }
     payload = create_video_request(asset, provider, base_dir)
-    response = request_with_retry(
-        "POST",
-        provider["endpoint"],
-        context=f"Video task creation ({asset['id']})",
-        headers=headers,
-        json=payload,
-        timeout=30,
-        attempts=3,
-        backoff_seconds=3.0,
-    )
-    task_info = response.json()
-    task_id = task_info.get("id")
-    if not task_id:
-        raise RuntimeError(f"Video task creation returned no task id: {json.dumps(task_info)}")
+    last_error: Exception | None = None
 
-    result = poll_video_task(provider, task_id)
-    video_url = extract_video_url(result)
-    download_file(video_url, target)
-    return target
+    for attempt in range(1, 4):
+        try:
+            response = requests.request(
+                "POST",
+                provider["endpoint"],
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            raise_for_status_with_hint(response, f"Video task creation ({asset['id']})")
+            task_info = response.json()
+            task_id = task_info.get("id")
+            if not task_id:
+                raise RuntimeError(f"Video task creation returned no task id: {json.dumps(task_info)}")
+
+            result = poll_video_task(provider, task_id)
+            video_url = extract_video_url(result)
+            download_file(video_url, target)
+            return target
+        except Exception as exc:
+            last_error = exc
+            if attempt == 3:
+                break
+            sleep_seconds = 3.0 * attempt
+            print(f"[RETRY] Video generation ({asset['id']}) draw {attempt}/3 failed, retrying in {sleep_seconds:.1f}s")
+            time.sleep(sleep_seconds)
+
+    raise RuntimeError(f"Video generation failed after 3 draws for asset {asset['id']}") from last_error
 
 
 def resolve_single_asset(asset: dict[str, Any], providers: dict[str, Any], output_root: Path, base_dir: Path, idx: int, total: int) -> tuple[str, str]:
