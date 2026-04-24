@@ -12,7 +12,7 @@ def slugify(value: str) -> str:
 
 
 def load_pipeline(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def ensure_parent(path: Path) -> None:
@@ -33,6 +33,12 @@ def resolved_path(pipeline: dict[str, Any], asset_id: str) -> str:
     return str(asset.get("resolved_path", ""))
 
 
+def media_src(path: str) -> str:
+    if not path:
+        return ""
+    return path if path.startswith("./") else f"./{path.lstrip('./')}"
+
+
 def build_html(pipeline: dict[str, Any]) -> str:
     fmt = pipeline["format"]
     composition_id = slugify(pipeline.get("project_name", "media-project"))
@@ -41,19 +47,23 @@ def build_html(pipeline: dict[str, Any]) -> str:
     def scene_markup(scene: dict[str, Any], idx: int) -> str:
         start = scene["start"]
         duration = scene["duration"]
-        bg = resolved_path(pipeline, scene.get("background_asset_id", ""))
-        hero = resolved_path(pipeline, scene.get("hero_asset_id", ""))
-        bg_html = ""
-        if bg.endswith((".mp4", ".webm", ".mov")):
-            bg_html = f"""<video id="bg-{idx}" class="clip bg" src="{bg}" muted playsinline data-start="{start}" data-duration="{duration}" data-track-index="{idx*10}"></video>"""
-        elif bg:
-            bg_html = f"""<img id="bg-{idx}" class="clip bg" src="{bg}" data-start="{start}" data-duration="{duration}" data-track-index="{idx*10}" />"""
+        visual_path = media_src(resolved_path(pipeline, scene.get("asset_id", "")))
+        visual_asset = find_asset(pipeline, scene.get("asset_id", ""))
+        audio_path = ""
+        if not (visual_asset and visual_asset.get("type") == "video"):
+            audio_path = media_src(resolved_path(pipeline, scene.get("audio_asset_id", "")))
+        visual_html = ""
+        if visual_path.endswith((".mp4", ".webm", ".mov")):
+            visual_html = f"""<video id="visual-{idx}" class="clip visual" src="{visual_path}" muted playsinline loop data-start="{start}" data-duration="{duration}" data-track-index="{idx*10}"></video>"""
+        elif visual_path:
+            visual_html = f"""<img id="visual-{idx}" class="clip visual" src="{visual_path}" data-start="{start}" data-duration="{duration}" data-track-index="{idx*10}" />"""
 
-        hero_html = ""
-        if hero.endswith((".mp4", ".webm", ".mov")):
-            hero_html = f"""<video id="hero-{idx}" class="clip hero" src="{hero}" muted playsinline data-start="{start}" data-duration="{duration}" data-track-index="{idx*10+1}"></video>"""
-        elif hero:
-            hero_html = f"""<img id="hero-{idx}" class="clip hero" src="{hero}" data-start="{start}" data-duration="{duration}" data-track-index="{idx*10+1}" />"""
+        audio_html = ""
+        if audio_path:
+            audio_html = (
+                f"""<audio id="audio-{idx}" class="clip narration" src="{audio_path}" """
+                f"""data-start="{start}" data-duration="{duration}" data-track-index="{idx*10+1}" data-volume="1"></audio>"""
+            )
 
         kicker = scene.get("kicker", "")
         body = scene.get("body") or scene.get("subtitle", "")
@@ -65,7 +75,8 @@ def build_html(pipeline: dict[str, Any]) -> str:
 
         return f"""
       <section id="{scene['id']}" class="scene clip" data-start="{start}" data-duration="{duration}" data-track-index="{idx*10+2}">
-        {bg_html}
+        {visual_html}
+        {audio_html}
         <div class="overlay"></div>
         <div class="copy">
           <div class="kicker">{kicker}</div>
@@ -73,7 +84,6 @@ def build_html(pipeline: dict[str, Any]) -> str:
           <p>{body}</p>
           {points_html}
         </div>
-        {hero_html}
       </section>
 """
 
@@ -109,7 +119,7 @@ def build_html(pipeline: dict[str, Any]) -> str:
       }}
       #root {{ position: relative; width: {fmt['width']}px; height: {fmt['height']}px; }}
       .scene {{ position: absolute; inset: 0; }}
-      .bg {{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; opacity:0.45; }}
+      .visual {{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; opacity:0.45; }}
       .overlay {{ position:absolute; inset:0; background: linear-gradient(90deg, rgba(5,9,20,0.78), rgba(5,9,20,0.2)); }}
       .copy {{
         position:absolute; left:112px; top:120px; width:760px;
@@ -125,11 +135,6 @@ def build_html(pipeline: dict[str, Any]) -> str:
       h1 {{ margin:0 0 14px; font-size:88px; line-height:0.94; letter-spacing:-2px; }}
       p {{ margin:0; font-size:31px; line-height:1.28; color: rgba(244,247,255,0.9); }}
       .points {{ margin:22px 0 0; padding-left:24px; font-size:22px; line-height:1.4; color: rgba(244,247,255,0.82); }}
-      .hero {{
-        position:absolute; right:112px; bottom:96px;
-        width:720px; height:720px; object-fit:cover;
-        border-radius:24px; box-shadow: 0 28px 90px rgba(0,0,0,0.48);
-      }}
     </style>
   </head>
   <body>

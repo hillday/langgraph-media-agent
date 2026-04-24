@@ -33,6 +33,11 @@ def _target_with_source_extension(target: str, source_image: str) -> str:
     return Path(target).with_suffix(source_suffix.lower()).as_posix()
 
 
+def _normalize_audio_target(target: str, audio_format: str) -> str:
+    suffix = f".{audio_format.strip('.').lower() or 'mp3'}"
+    return Path(target).with_suffix(suffix).as_posix()
+
+
 def build_pipeline_payload(
     settings: Settings, plan: PlanResult, uploaded_images: list[str], output_dir_name: str
 ) -> dict[str, Any]:
@@ -42,6 +47,14 @@ def build_pipeline_payload(
     for asset in plan.assets:
         asset_payload = asset.model_dump()
         asset_source = asset.asset_source
+
+        if asset.type == "audio":
+            asset_payload["asset_source"] = "generated"
+            asset_payload["reference_images"] = []
+            asset_payload["reference_image_indexes"] = []
+            asset_payload["target"] = _normalize_audio_target(asset.target, settings.tts_provider_audio_format)
+            assets.append(asset_payload)
+            continue
 
         if asset.type == "video" and asset_source == "local":
             asset_source = "generated_with_reference"
@@ -124,6 +137,15 @@ def build_pipeline_payload(
                 "ratio": plan.ratio,
                 "watermark": False,
                 "generate_audio": True,
+            },
+            "audio": {
+                "endpoint": settings.tts_provider_endpoint,
+                "app_id": settings.tts_provider_app_id,
+                "access_key": settings.tts_provider_access_key,
+                "resource_id": settings.tts_provider_resource_id,
+                "voice": settings.tts_provider_voice,
+                "audio_format": settings.tts_provider_audio_format,
+                "sample_rate": settings.tts_provider_sample_rate,
             },
         },
         "assets": assets,

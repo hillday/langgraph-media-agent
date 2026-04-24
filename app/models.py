@@ -18,11 +18,13 @@ Stage = Literal[
 
 class AssetPlan(BaseModel):
     id: str
-    type: Literal["image", "video"]
-    prompt: str
+    type: Literal["image", "video", "audio"]
+    prompt: str = ""
     description: str = ""
     target: str
     duration: int | None = None
+    target_duration: float | None = None
+    text: str = ""
     ratio: str | None = None
     use_uploaded_images_as_references: bool = False
     asset_source: Literal["local", "generated", "generated_with_reference"] | None = None
@@ -39,6 +41,8 @@ class ScenePlan(BaseModel):
     body: str = ""
     points: list[str] = Field(default_factory=list)
     asset_id: str
+    audio_asset_id: str | None = None
+    voiceover_text: str = ""
     transition_in: str = ""
     text_animation: str = ""
 

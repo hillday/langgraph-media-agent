@@ -2,12 +2,37 @@
 
 Web UI agent for prompt-to-video production on top of HyperFrames.
 
+## Why This Approach
+
+This project is intentionally not a "generate one long video clip and hope for the best" workflow. It combines short generated media with HTML-based composition, which gives it three practical advantages:
+
+1. **Better transitions with HTML**
+   - Scene-to-scene transitions are built in HTML/CSS/GSAP instead of relying only on raw video generation.
+   - That makes transitions more stable, smoother, and far more controllable.
+   - It also gives access to a richer visual vocabulary: wipes, layered reveals, masked motion, typography-led transitions, and other deterministic effects that are difficult to get consistently from a single generated video.
+
+2. **Better text and typography**
+   - Text rendering inside generated video clips is often unreliable: wrong layout, weak hierarchy, poor readability, or awkward motion.
+   - HTML composition fixes that gap by handling titles, price cards, product callouts, subtitles, captions, and text animation in a deterministic layer.
+   - This is especially useful for ads, e-commerce creatives, and information-dense short videos where text quality directly affects performance.
+
+3. **Much better cost efficiency**
+   - A full 30-second video generated entirely with a model such as Seedance 2.0 may cost around `30 RMB`.
+   - In this project, the same style of output can often be built from:
+     - one 5-second generated video clip, around `5 RMB`
+     - around six generated images, around `1 RMB`
+     - LLM / planning / HTML authoring token usage at roughly million-token scale, around `1 RMB`
+   - That means many ad and commerce scenarios can land closer to `7 RMB` instead of `30 RMB`, while still gaining better text control and more polished transitions.
+
+In practice, this architecture is particularly attractive for performance ads, product promos, e-commerce materials, and other asset-driven short-form content where quality-per-cost matters.
+
 ## What It Does
 
 - Accepts user text input and optional reference images
 - Uses a LangGraph planner / executor / verifier loop
 - Asks clarification questions when the request is underspecified
 - Generates local image/video assets via the existing media pipeline scripts
+- Generates per-scene TTS narration audio for scenes that need voiceover
 - Loads skill context dynamically from:
   - `skills/`
   - `.trae/skills/`
@@ -137,6 +162,11 @@ Copy `.env.example` and export the real values in your shell:
 MODEL_API_BASE=https://ark.cn-beijing.volces.com/api/v3
 MODEL_API_KEY_ENV=ARK_API_KEY
 MODEL_NAME=ep-your-chat-model
+TTS_PROVIDER_ENDPOINT=https://openspeech.bytedance.com/api/v3/tts/unidirectional
+TTS_PROVIDER_APP_ID=your_app_id
+TTS_PROVIDER_ACCESS_KEY=your_access_key
+TTS_PROVIDER_RESOURCE_ID=your_resource_id
+TTS_PROVIDER_VOICE=zh_female_cancan_mars_bigtts
 APP_HOST=127.0.0.1
 APP_PORT=8010
 HYPERFRAMES_BIN=

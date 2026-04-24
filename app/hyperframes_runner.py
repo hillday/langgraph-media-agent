@@ -50,6 +50,13 @@ def run_hyperframes_command(
             check=check,
             timeout=timeout_seconds or settings.hyperframes_command_timeout_seconds,
         )
+    except subprocess.CalledProcessError as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        output = ((stdout + "\n" + stderr).strip() or "(no output)")
+        raise RuntimeError(
+            f"HyperFrames command failed with exit code {exc.returncode}: {' '.join(command)}\n{output}"
+        ) from exc
     except subprocess.TimeoutExpired as exc:
         def _to_text(value: object) -> str:
             if value is None:

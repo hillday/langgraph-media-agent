@@ -5,7 +5,9 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import time
+import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -296,22 +298,153 @@ def generate_video(asset: dict[str, Any], provider: dict[str, Any], output_root:
     raise RuntimeError(f"Video generation failed after 3 draws for asset {asset['id']}") from last_error
 
 
-def resolve_single_asset(asset: dict[str, Any], providers: dict[str, Any], output_root: Path, base_dir: Path, idx: int, total: int) -> tuple[str, str]:
+def ensure_tts_credentials(provider: dict[str, Any]) -> None:
+    missing = [name for name in ("app_id", "access_key", "resource_id") if not str(provider.get(name, "")).strip()]
+    if missing:
+        joined = ", ".join(missing)
+        raise RuntimeError(f"Missing TTS provider configuration: {joined}. Set TTS_PROVIDER_APP_ID / ACCESS_KEY / RESOURCE_ID.")
+
+
+def get_audio_duration_seconds(path: Path) -> float | None:
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        value = (probe.stdout or "").strip()
+        if value:
+            return float(value)
+    except Exception:
+        pass
+
+    if path.suffix.lower() == ".wav":
+        try:
+            with wave.open(str(path), "rb") as wav_file:
+                frame_rate = wav_file.getframerate() or 1
+                return wav_file.getnframes() / frame_rate
+        except Exception:
+            return None
+    return None
+
+
+def tts_http_stream(url: str, headers: dict[str, str], params: dict[str, Any], audio_save_path: Path) -> None:
+    session = requests.Session()
+    response: requests.Response | None = None
+    try:
+        ensure_parent(audio_save_path)
+        response = session.post(url, headers=headers, json=params, stream=True, timeout=300)
+        if response.status_code not in (200,):
+            details = response.text[:800].strip()
+            raise RuntimeError(f"TTS request failed with status {response.status_code}. Response: {details}")
+
+        audio_data = bytearray()
+        for chunk in response.iter_lines(decode_unicode=True):
+            if not chunk:
+                continue
+            data = json.loads(chunk)
+            if data.get("code", 0) == 0 and data.get("data"):
+                audio_data.extend(base64.b64decode(data["data"]))
+                continue
+            if data.get("code", 0) == 0 and data.get("sentence"):
+                continue
+            if data.get("code", 0) == 20000000:
+                break
+            if data.get("code", 0) > 0:
+                raise RuntimeError(f"TTS error response: {data}")
+
+        if not audio_data:
+            raise RuntimeError("TTS generation returned empty audio data.")
+
+        audio_save_path.write_bytes(audio_data)
+        try:
+            os.chmod(audio_save_path, 0o644)
+        except Exception:
+            pass
+    finally:
+        if response is not None:
+            response.close()
+        session.close()
+
+
+def generate_audio(asset: dict[str, Any], provider: dict[str, Any], output_root: Path) -> tuple[Path, float | None]:
+    ensure_tts_credentials(provider)
+    target = output_root / asset["target"]
+    text = str(asset.get("text") or asset.get("prompt") or "").strip()
+    if not text:
+        raise RuntimeError(f"Audio asset {asset['id']} is missing narration text.")
+
+    if not target.exists():
+        headers = {
+            "X-Api-App-Id": str(provider["app_id"]),
+            "X-Api-Access-Key": str(provider["access_key"]),
+            "X-Api-Resource-Id": str(provider["resource_id"]),
+            "Content-Type": "application/json",
+            "Connection": "keep-alive",
+        }
+        payload = {
+            "user": {"uid": f"media-agent-{asset['id']}"},
+            "req_params": {
+                "text": text,
+                "speaker": provider.get("voice", "zh_female_cancan_mars_bigtts"),
+                "audio_params": {
+                    "format": provider.get("audio_format", "mp3"),
+                    "sample_rate": int(provider.get("sample_rate", 24000)),
+                    "enable_timestamp": True,
+                },
+                "additions": json.dumps(
+                    {
+                        "explicit_language": "zh",
+                        "disable_markdown_filter": True,
+                        "enable_timestamp": True,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        }
+        tts_http_stream(str(provider["endpoint"]), headers, payload, target)
+
+    duration = get_audio_duration_seconds(target)
+    target_duration = float(asset.get("target_duration") or asset.get("duration") or 0)
+    if duration is not None and target_duration > 0 and abs(duration - target_duration) > 0.12:
+        print(
+            f"[PROGRESS] Audio duration drift for {asset['id']}: target={target_duration:.3f}s actual={duration:.3f}s; "
+            "will retime scenes using actual TTS duration."
+        )
+    return target, duration
+
+
+def resolve_single_asset(
+    asset: dict[str, Any], providers: dict[str, Any], output_root: Path, base_dir: Path, idx: int, total: int
+) -> tuple[str, dict[str, Any]]:
     asset_type = asset["type"]
     desc = asset.get("description") or asset.get("id", "")
     print(f"[PROGRESS] Generating asset {idx}/{total}: {desc} ({asset_type})")
+    duration: float | None = None
     if asset_type == "image":
         generated = generate_image(asset, providers["image"], output_root, base_dir)
     elif asset_type == "video":
         generated = generate_video(asset, providers["video"], output_root, base_dir)
+    elif asset_type == "audio":
+        generated, duration = generate_audio(asset, providers["audio"], output_root)
     else:
         raise ValueError(f"Unsupported asset type: {asset_type}")
     print(f"[PROGRESS] Asset {idx}/{total} done: {desc}")
-    return asset["id"], generated.relative_to(output_root).as_posix()
+    return asset["id"], {"resolved_path": generated.relative_to(output_root).as_posix(), "duration": duration}
 
 
-def resolve_assets(pipeline: dict[str, Any], output_root: Path, base_dir: Path) -> dict[str, str]:
-    resolved: dict[str, str] = {}
+def resolve_assets(pipeline: dict[str, Any], output_root: Path, base_dir: Path) -> dict[str, dict[str, Any]]:
+    resolved: dict[str, dict[str, Any]] = {}
     providers = pipeline["providers"]
     total = len(pipeline["assets"])
     max_workers = min(len(pipeline["assets"]), 4) or 1
@@ -321,17 +454,71 @@ def resolve_assets(pipeline: dict[str, Any], output_root: Path, base_dir: Path) 
             for idx, asset in enumerate(pipeline["assets"], start=1)
         }
         for future in as_completed(futures):
-            asset_id, path = future.result()
-            resolved[asset_id] = path
+            asset_id, payload = future.result()
+            resolved[asset_id] = payload
     return resolved
 
 
-def build_resolved_pipeline(pipeline: dict[str, Any], resolved_assets: dict[str, str]) -> dict[str, Any]:
+def retime_scenes_from_audio(resolved_pipeline: dict[str, Any]) -> None:
+    assets_by_id = {asset["id"]: asset for asset in resolved_pipeline.get("assets", [])}
+    scenes = resolved_pipeline.get("scenes", [])
+    if not scenes:
+        return
+
+    cumulative_shift = 0.0
+    max_end = 0.0
+    for scene in scenes:
+        original_start = float(scene.get("start", 0.0))
+        original_duration = float(scene.get("duration", 0.0))
+        new_duration = original_duration
+
+        audio_asset_id = scene.get("audio_asset_id")
+        if audio_asset_id:
+            audio_asset = assets_by_id.get(audio_asset_id)
+            actual_duration = audio_asset.get("resolved_duration") if audio_asset else None
+            if actual_duration is not None:
+                new_duration = round(float(actual_duration), 3)
+                scene["resolved_audio_duration"] = new_duration
+
+        new_start = round(original_start + cumulative_shift, 3)
+        scene["start"] = new_start
+        scene["duration"] = new_duration
+
+        delta = new_duration - original_duration
+        cumulative_shift += delta
+        max_end = max(max_end, new_start + new_duration)
+
+    fmt = resolved_pipeline.setdefault("format", {})
+    fmt["duration"] = round(max_end, 3)
+
+
+def build_resolved_pipeline(pipeline: dict[str, Any], resolved_assets: dict[str, dict[str, Any]]) -> dict[str, Any]:
     resolved_pipeline = json.loads(json.dumps(pipeline))
+    asset_index = {asset["id"]: asset for asset in resolved_pipeline.get("assets", [])}
     for asset in resolved_pipeline.get("assets", []):
         asset_id = asset["id"]
-        asset["resolved_path"] = resolved_assets.get(asset_id, "")
+        resolved = resolved_assets.get(asset_id, {})
+        asset["resolved_path"] = resolved.get("resolved_path", "")
         asset["resolved"] = bool(asset.get("resolved_path"))
+        if resolved.get("duration") is not None:
+            asset["resolved_duration"] = round(float(resolved["duration"]), 3)
+
+    for scene in resolved_pipeline.get("scenes", []):
+        asset_id = scene.get("asset_id")
+        audio_asset_id = scene.get("audio_asset_id")
+        visual_asset = asset_index.get(asset_id) if asset_id else None
+        if visual_asset and visual_asset.get("type") == "video":
+            scene["audio_asset_id"] = None
+            scene["voiceover_text"] = ""
+            audio_asset_id = None
+        audio_asset = asset_index.get(audio_asset_id) if audio_asset_id else None
+        scene["resolved_asset_path"] = visual_asset.get("resolved_path", "") if visual_asset else ""
+        scene["resolved_audio_path"] = audio_asset.get("resolved_path", "") if audio_asset else ""
+        if audio_asset and audio_asset.get("resolved_duration") is not None:
+            scene["resolved_audio_duration"] = audio_asset["resolved_duration"]
+        if audio_asset and not scene.get("voiceover_text"):
+            scene["voiceover_text"] = audio_asset.get("text", "")
+    retime_scenes_from_audio(resolved_pipeline)
     return resolved_pipeline
 
 
@@ -352,14 +539,16 @@ def write_pipeline_outputs(output_root: Path, resolved_pipeline: dict[str, Any])
     ]
     for asset in resolved_pipeline.get("assets", []):
         brief_lines.append(
-            f"- {asset.get('id')}: type={asset.get('type')}, source={asset.get('asset_source', 'generated')}, path={asset.get('resolved_path', '(missing)')}"
+            f"- {asset.get('id')}: type={asset.get('type')}, source={asset.get('asset_source', 'generated')}, path={asset.get('resolved_path', '(missing)')}, duration={asset.get('resolved_duration', asset.get('target_duration', ''))}"
         )
     brief_lines.append("")
     brief_lines.append("## Scenes")
     for scene in resolved_pipeline.get("scenes", []):
         brief_lines.append(
-            f"- {scene.get('id')}: start={scene.get('start')}s, duration={scene.get('duration')}s, title={scene.get('title', '')}"
+            f"- {scene.get('id')}: start={scene.get('start')}s, duration={scene.get('duration')}s, title={scene.get('title', '')}, asset={scene.get('asset_id', '')}, audio={scene.get('audio_asset_id', '')}"
         )
+        if scene.get("voiceover_text"):
+            brief_lines.append(f"  voiceover: {scene.get('voiceover_text')}")
     brief_lines.append("")
     (output_root / "creative-brief.md").write_text("\n".join(brief_lines) + "\n", encoding="utf-8")
 

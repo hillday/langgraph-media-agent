@@ -40,6 +40,15 @@ class Settings:
         "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
     )
     video_provider_model: str = os.environ.get("VIDEO_PROVIDER_MODEL", "doubao-seedance-2-0-fast-260128")
+    tts_provider_endpoint: str = os.environ.get(
+        "TTS_PROVIDER_ENDPOINT", "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+    )
+    tts_provider_app_id: str = os.environ.get("TTS_PROVIDER_APP_ID", "")
+    tts_provider_access_key: str = os.environ.get("TTS_PROVIDER_ACCESS_KEY", "")
+    tts_provider_resource_id: str = os.environ.get("TTS_PROVIDER_RESOURCE_ID", "")
+    tts_provider_voice: str = os.environ.get("TTS_PROVIDER_VOICE", "zh_female_cancan_mars_bigtts")
+    tts_provider_audio_format: str = os.environ.get("TTS_PROVIDER_AUDIO_FORMAT", "mp3")
+    tts_provider_sample_rate: int = int(os.environ.get("TTS_PROVIDER_SAMPLE_RATE", "24000"))
     app_host: str = os.environ.get("APP_HOST", "127.0.0.1")
     app_port: int = int(os.environ.get("APP_PORT", "8010"))
     hyperframes_bin: str = os.environ.get("HYPERFRAMES_BIN", "").strip()
