@@ -112,6 +112,41 @@ def extract_html_document(text: str) -> str:
     raise ValueError("Model response does not contain a complete HTML document.")
 
 
+def detect_text_visibility_risks(html: str) -> list[str]:
+    risks: list[str] = []
+    css_hidden_text_patterns = [
+        r"\.(?:kicker|title|body|point|copy|headline|subtitle|caption|cta)\b[^{}]*\{[^{}]*opacity\s*:\s*0\b",
+        r"(?:^|[,{])\s*(?:h1|h2|h3|h4|p|li|span)\b[^{}]*\{[^{}]*opacity\s*:\s*0\b",
+    ]
+    has_hidden_text_css = any(re.search(pattern, html, re.IGNORECASE | re.DOTALL | re.MULTILINE) for pattern in css_hidden_text_patterns)
+    has_from_opacity_zero = bool(re.search(r"\b(?:gsap|tl)\.from(?:To)?\s*\([\s\S]*?opacity\s*:\s*0\b", html, re.IGNORECASE))
+    has_from_to_opacity_one = bool(
+        re.search(
+            r"\b(?:gsap|tl)\.fromTo\s*\([\s\S]*?\{[\s\S]*?opacity\s*:\s*0\b[\s\S]*?\}\s*,\s*\{[\s\S]*?opacity\s*:\s*1\b",
+            html,
+            re.IGNORECASE,
+        )
+    )
+
+    if has_hidden_text_css and re.search(r"\b(?:gsap|tl)\.from\s*\([\s\S]*?opacity\s*:\s*0\b", html, re.IGNORECASE):
+        risks.append(
+            "text_visibility_risk: text-like CSS selectors default to opacity:0 while GSAP uses from(... opacity:0 ...); "
+            "this usually animates from invisible to invisible, so rendered text never appears"
+        )
+
+    if has_hidden_text_css and not has_from_to_opacity_one:
+        risks.append(
+            "text_visibility_risk: text-like CSS selectors default to opacity:0 without a clear matching fromTo/to animation back to opacity:1"
+        )
+
+    if has_hidden_text_css and not has_from_opacity_zero and not re.search(r"\b(?:gsap|tl)\.(?:to|set)\s*\([\s\S]*?opacity\s*:\s*1\b", html, re.IGNORECASE):
+        risks.append(
+            "text_visibility_risk: text-like CSS selectors default to opacity:0 but no deterministic GSAP reveal to opacity:1 was found"
+        )
+
+    return risks
+
+
 def image_path_to_data_url(image_path: str) -> str:
     file_path = Path(image_path).resolve()
     if not file_path.exists():
@@ -545,6 +580,9 @@ Requirements:
 - Do not drop or hide important planned copy such as product names, selling points, prices, CTAs, scene titles, or body copy.
 - Typography should be bold, large, and high-contrast enough to stay clear after video rendering on mobile screens.
 - Avoid thin text, low-contrast text, over-blurred text containers, or text sitting on busy image regions without protection.
+- Do NOT leave readable text permanently hidden by default CSS. If text starts hidden for animation, you MUST deterministically reveal it to visible state during its active scene window.
+- Do NOT combine default CSS `opacity:0` on readable text with `gsap.from(... opacity:0 ...)`; that pattern keeps text invisible in the final render.
+- Prefer visible default text styles plus entrance motion, or use explicit `gsap.fromTo(..., {{ opacity: 0 }}, {{ opacity: 1, ... }})` / `gsap.to(..., {{ opacity: 1, ... }})` when starting hidden is intentional.
 - Every scene must have a visible visual asset covering the full scene duration. Do not leave any scene visually empty.
 - The final scene's media must remain visible until the composition end time; do not create an empty last 3-5 seconds.
 - Prefer simple, robust layering over clever but fragile structures.
@@ -566,6 +604,8 @@ Requirements:
 - HARD CONSTRAINT: Scene text overlays must have a higher visual layer than the underlying media, using explicit CSS positioning and z-order.
 - HARD CONSTRAINT: Do NOT leave earlier media visible above later clips because of missing absolute positioning, missing `clip`, or incorrect stacking order.
 - HARD CONSTRAINT: Do NOT rely on track index alone for text visibility or scene layering. Use explicit DOM structure and CSS layering inside each scene.
+- HARD CONSTRAINT: Readable text must not remain at CSS `opacity:0` unless the generated timeline deterministically restores it to visible state for the intended on-screen window.
+- HARD CONSTRAINT: Do NOT use the broken combination of CSS-hidden text plus `gsap.from(... opacity:0 ...)` for the same text reveal. Use visible default text or explicit `fromTo` / `to` to `opacity:1`.
 - HARD CONSTRAINT: Image assets MUST use normal `<img>` elements with local `./assets/...` paths.
 - HARD CONSTRAINT: Video assets MUST use normal `<video>` elements with local `./assets/...` paths, and every video element MUST include `muted playsinline`.
 - HARD CONSTRAINT: Because video elements remain `muted`, any scene that should be audible must have a separate timed `<audio>` element. For video scenes without narration TTS, use the same local video file as the `<audio src>` when appropriate, or another local extracted audio track.
@@ -622,6 +662,8 @@ def validate_html_node(state: AgentState, *, settings: Settings) -> AgentState:
             "lint_output": f"error: invalid html output: {exc}",
             "validate_output": f"error: invalid html output: {exc}",
         }
+    html_text = index_path.read_text(encoding="utf-8")
+    text_visibility_risks = detect_text_visibility_risks(html_text)
     try:
         lint_result = run_hyperframes_command(settings, ["lint", str(project_dir)], project_dir, check=False)
         lint_output = (lint_result.stdout or "") + (lint_result.stderr or "")
@@ -639,6 +681,9 @@ def validate_html_node(state: AgentState, *, settings: Settings) -> AgentState:
     except Exception as exc:
         validate_output = f"validate error: {exc}"
         logger.exception("Validate command failed for session `%s`", state.get("session_id", "unknown"))
+    if text_visibility_risks:
+        risk_output = "\n".join(f"error: {risk}" for risk in text_visibility_risks)
+        validate_output = ((validate_output.rstrip() + "\n") if validate_output.strip() else "") + risk_output
     logger.debug("Lint output for session `%s`\n%s", state.get("session_id", "unknown"), lint_output)
     logger.debug("Validate output for session `%s`\n%s", state.get("session_id", "unknown"), validate_output)
     return {
@@ -684,6 +729,7 @@ Prefer fixing `index.html` in place.
 Return final HTML only if you are not already writing it with write_file.
 - Treat the injected skill references as authoritative repair guidance.
 - Prefer repairing toward the skill-provided HyperFrames patterns instead of inventing a new structure.
+- Before making edits, inspect the current `index.html` and use the provided lint/validate outputs as concrete failure evidence.
 - Fix the HTML to satisfy these hard constraints:
 - Every timed scene container MUST include the `clip` class.
 - Keep image assets as normal `<img>` elements and video assets as normal timed `<video>` elements with `muted playsinline`, `data-start`, `data-duration`, and `data-track-index`.
@@ -695,6 +741,8 @@ Return final HTML only if you are not already writing it with write_file.
 - Remove any non-deterministic code such as `Date`, `new Date()`, `Math.random()`, or runtime-generated IDs.
 - Do NOT add `autoplay` or custom `video.play()` bootstrap code during repair unless the user explicitly asks for that behavior.
 - Keep `<video>` muted unless the project intentionally introduces a separate timed audio track.
+- Repair any hidden-text bug where readable copy stays at CSS `opacity:0` or where CSS-hidden text is paired with `gsap.from(... opacity:0 ...)`.
+- Prefer visible default text plus motion, or explicit `fromTo` / `to` tweens that end at `opacity:1`.
 """
     prompt = f"""
 Project directory:
@@ -716,7 +764,9 @@ Lint output:
 Validate output:
 {state.get("validate_output", "")}
 
-Read the current project files before fixing if needed.
+The lint/validate outputs above are the primary repair targets. Use them explicitly.
+You MUST read the current `index.html` before fixing so your repair is grounded in the actual generated code.
+When a validation message names a concrete risk such as hidden text, trace that risk back to the exact CSS/GSAP pattern in the file and repair that pattern directly.
 Treat `timed_element_missing_clip_class` as a real issue that must be fixed, not as an ignorable warning.
 """
 
