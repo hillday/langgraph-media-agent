@@ -69,21 +69,22 @@ def _append_progress(session: SessionData, message: str) -> SessionData:
 
 
 def _update_from_state(session: SessionData, state: AgentState) -> SessionData:
-    return session.model_copy(
-        update={
-            "stage": state.get("stage", session.stage),
-            "clarification_questions": state.get("clarification_questions", session.clarification_questions),
-            "selected_skills": state.get("selected_skills", session.selected_skills),
-            "plan_summary": state.get("plan", {}).get("summary", session.plan_summary),
-            "project_dir": state.get("project_dir", session.project_dir),
-            "pipeline_path": state.get("pipeline_path", session.pipeline_path),
-            "resolved_pipeline_path": state.get("resolved_pipeline_path", session.resolved_pipeline_path),
-            "creative_brief_path": state.get("creative_brief_path", session.creative_brief_path),
-            "render_output_path": state.get("render_output_path", session.render_output_path),
-            "pipeline": state.get("plan", session.pipeline),
-            "last_error": state.get("last_error", session.last_error),
-        }
-    )
+    update: dict[str, Any] = {
+        "stage": state.get("stage", session.stage),
+        "clarification_questions": state.get("clarification_questions", session.clarification_questions),
+        "selected_skills": state.get("selected_skills", session.selected_skills),
+        "plan_summary": state.get("plan", {}).get("summary", session.plan_summary),
+        "project_dir": state.get("project_dir", session.project_dir),
+        "pipeline_path": state.get("pipeline_path", session.pipeline_path),
+        "resolved_pipeline_path": state.get("resolved_pipeline_path", session.resolved_pipeline_path),
+        "creative_brief_path": state.get("creative_brief_path", session.creative_brief_path),
+        "render_output_path": state.get("render_output_path", session.render_output_path),
+        "pipeline": state.get("plan", session.pipeline),
+        "last_error": state.get("last_error", session.last_error),
+    }
+    if state.get("session_stats"):
+        update["stats"] = state["session_stats"]
+    return session.model_copy(update=update)
 
 
 def _run_workflow_sync(session_dir: Path, session: SessionData) -> None:

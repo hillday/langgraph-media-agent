@@ -85,3 +85,9 @@ class SessionData(BaseModel):
     last_error: str = ""
     feedback_history: list[str] = Field(default_factory=list)
     pipeline: dict[str, Any] = Field(default_factory=dict)
+    stats: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "tokens": {"input": 0, "output": 0, "total": 0},
+            "media": {"videos_generated": 0, "images_generated": 0},
+        }
+    )

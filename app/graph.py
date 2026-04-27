@@ -48,6 +48,7 @@ class AgentState(TypedDict, total=False):
     verification: dict[str, Any]
     html_revision_count: int
     last_error: str
+    session_stats: dict[str, Any]
 
 
 def slugify(value: str) -> str:
@@ -73,6 +74,79 @@ def _message_to_log_dict(message: Any) -> dict[str, Any]:
         "tool_calls": getattr(message, "tool_calls", None),
         "additional_kwargs": getattr(message, "additional_kwargs", None),
     }
+
+
+def empty_session_stats() -> dict[str, Any]:
+    return {
+        "tokens": {"input": 0, "output": 0, "total": 0},
+        "media": {"videos_generated": 0, "images_generated": 0},
+    }
+
+
+def normalize_session_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = empty_session_stats()
+    if not isinstance(stats, dict):
+        return normalized
+
+    tokens = stats.get("tokens")
+    if isinstance(tokens, dict):
+        normalized["tokens"]["input"] = int(tokens.get("input", 0) or 0)
+        normalized["tokens"]["output"] = int(tokens.get("output", 0) or 0)
+        normalized["tokens"]["total"] = int(tokens.get("total", 0) or 0)
+
+    media = stats.get("media")
+    if isinstance(media, dict):
+        normalized["media"]["videos_generated"] = int(media.get("videos_generated", 0) or 0)
+        normalized["media"]["images_generated"] = int(media.get("images_generated", 0) or 0)
+
+    return normalized
+
+
+def extract_llm_token_usage(response: Any) -> dict[str, int]:
+    usage: dict[str, Any] = {}
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if isinstance(usage_metadata, dict):
+        usage = usage_metadata
+
+    if not usage:
+        response_metadata = getattr(response, "response_metadata", None)
+        if isinstance(response_metadata, dict):
+            nested_usage = response_metadata.get("token_usage") or response_metadata.get("usage") or {}
+            if isinstance(nested_usage, dict):
+                usage = nested_usage
+
+    input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+    output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+    total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or (input_tokens + output_tokens))
+    return {"input": input_tokens, "output": output_tokens, "total": total_tokens}
+
+
+def record_llm_token_usage(stats: dict[str, Any], response: Any) -> None:
+    normalized = normalize_session_stats(stats)
+    usage = extract_llm_token_usage(response)
+    normalized["tokens"]["input"] += usage["input"]
+    normalized["tokens"]["output"] += usage["output"]
+    normalized["tokens"]["total"] += usage["total"]
+    stats.clear()
+    stats.update(normalized)
+
+
+def compute_media_stats(resolved_pipeline_path: Path) -> dict[str, int]:
+    if not resolved_pipeline_path.exists():
+        return {"videos_generated": 0, "images_generated": 0}
+
+    resolved_pipeline = json.loads(resolved_pipeline_path.read_text(encoding="utf-8"))
+    videos_generated = 0
+    images_generated = 0
+    for asset in resolved_pipeline.get("assets", []):
+        if not asset.get("resolved"):
+            continue
+        if asset.get("type") == "video":
+            videos_generated += 1
+        elif asset.get("type") == "image" and asset.get("asset_source") != "local":
+            images_generated += 1
+
+    return {"videos_generated": videos_generated, "images_generated": images_generated}
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -163,6 +237,7 @@ def invoke_json_prompt(
     schema: type[Any],
     *,
     image_paths: list[str] | None = None,
+    session_stats: dict[str, Any] | None = None,
 ) -> Any:
     schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)
     full_prompt = f"""
@@ -209,6 +284,8 @@ Return only a valid JSON object.
     )
     try:
         response = model.invoke(messages)
+        if session_stats is not None:
+            record_llm_token_usage(session_stats, response)
         raw_content = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
         normalized_content = raw_content.lstrip()
         content = normalized_content if normalized_content.startswith("{") else "{" + normalized_content
@@ -234,6 +311,7 @@ def run_file_tool_authoring_loop(
     readable_roots: list[Path],
     allowed_scripts: list[Path],
     max_tool_call_steps: int,
+    session_stats: dict[str, Any] | None = None,
 ) -> str:
     logger.info("Starting file-tool authoring loop for `%s`", base_dir)
     tools = build_file_tools(
@@ -253,6 +331,8 @@ def run_file_tool_authoring_loop(
             _serialize_for_log([_message_to_log_dict(message) for message in messages]),
         )
         response = llm.invoke(messages)
+        if session_stats is not None:
+            record_llm_token_usage(session_stats, response)
         logger.debug(
             "LLM response `run_file_tool_authoring_loop` step=%s\n%s",
             step_index + 1,
@@ -305,6 +385,7 @@ def run_file_tool_authoring_loop(
 
 def planner_node(state: AgentState, *, settings: Settings, registry: SkillRegistry, model: Any) -> AgentState:
     logger.info("Entering planner node for session `%s`", state.get("session_id", "unknown"))
+    session_stats = normalize_session_stats(state.get("session_stats"))
     prompt = f"""
 You are planning a web-based prompt-to-video agent.
 
@@ -372,7 +453,13 @@ Rules:
 - Audio assets are generated by TTS, not uploaded images, so do not use `asset_source="local"` for audio assets.
 """
     try:
-        plan = invoke_json_prompt(model, prompt, PlanResult, image_paths=state.get("uploaded_images", []))
+        plan = invoke_json_prompt(
+            model,
+            prompt,
+            PlanResult,
+            image_paths=state.get("uploaded_images", []),
+            session_stats=session_stats,
+        )
     except Exception:
         logger.exception("Planner node failed for session `%s`", state.get("session_id", "unknown"))
         raise
@@ -390,6 +477,7 @@ Rules:
         "clarification_questions": plan.clarification_questions,
         "selected_skills": selected_skills,
         "html_revision_count": 0,
+        "session_stats": session_stats,
     }
 
 
@@ -445,6 +533,8 @@ def generate_assets_node(state: AgentState, *, settings: Settings) -> AgentState
         state.get("session_id", "unknown"),
         len(progress_lines),
     )
+    session_stats = normalize_session_stats(state.get("session_stats"))
+    session_stats["media"] = compute_media_stats(project_dir / "pipeline.resolved.json")
 
     return {
         "stage": "executing",
@@ -452,11 +542,13 @@ def generate_assets_node(state: AgentState, *, settings: Settings) -> AgentState
         "pipeline_path": str(pipeline_path),
         "resolved_pipeline_path": str(project_dir / "pipeline.resolved.json"),
         "creative_brief_path": str(project_dir / "creative-brief.md"),
+        "session_stats": session_stats,
     }
 
 
 def verify_assets_node(state: AgentState, *, model: Any) -> AgentState:
     logger.info("Entering verify_assets node for session `%s`", state.get("session_id", "unknown"))
+    session_stats = normalize_session_stats(state.get("session_stats"))
     resolved_pipeline = Path(state["resolved_pipeline_path"]).read_text(encoding="utf-8")
     verification = invoke_json_prompt(
         model,
@@ -482,13 +574,14 @@ Return:
 - blocked if generation clearly failed
 """,
         VerificationResult,
+        session_stats=session_stats,
     )
     logger.info(
         "Verify assets decision for session `%s`: %s",
         state.get("session_id", "unknown"),
         verification.decision,
     )
-    return {"verification": verification.model_dump()}
+    return {"verification": verification.model_dump(), "session_stats": session_stats}
 
 
 def verification_router(state: AgentState) -> str:
@@ -623,6 +716,7 @@ Requirements:
 - HARD CONSTRAINT: Prefer `loop` for short visual video backgrounds when needed. Do NOT add `autoplay` or custom `video.play()` bootstrap code in the generated HTML.
 - HARD CONSTRAINT: If audio is intentionally needed, it must be a separate timed `<audio>` element. Otherwise keep videos muted and visual-only.
 """
+    session_stats = normalize_session_stats(state.get("session_stats"))
     html = run_file_tool_authoring_loop(
         model=model,
         system_prompt=system_prompt,
@@ -631,6 +725,7 @@ Requirements:
         readable_roots=[project_dir, resolved_pipeline_path.parent, settings.repo_root, *settings.skills_dirs],
         allowed_scripts=[settings.media_pipeline_script, settings.html_builder_script],
         max_tool_call_steps=settings.max_tool_call_steps,
+        session_stats=session_stats,
     )
     index_path = project_dir / "index.html"
     if not index_path.exists() or html:
@@ -645,7 +740,7 @@ Requirements:
             "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-    return {"stage": "executing"}
+    return {"stage": "executing", "session_stats": session_stats}
 
 
 def validate_html_node(state: AgentState, *, settings: Settings) -> AgentState:
@@ -773,6 +868,7 @@ When a validation message names a concrete risk such as hidden text, trace that 
 Treat `timed_element_missing_clip_class` as a real issue that must be fixed, not as an ignorable warning.
 """
 
+    session_stats = normalize_session_stats(state.get("session_stats"))
     html = run_file_tool_authoring_loop(
         model=model,
         system_prompt=system_prompt,
@@ -781,13 +877,14 @@ Treat `timed_element_missing_clip_class` as a real issue that must be fixed, not
         readable_roots=[project_dir, settings.repo_root, *settings.skills_dirs],
         allowed_scripts=[settings.media_pipeline_script, settings.html_builder_script],
         max_tool_call_steps=settings.max_tool_call_steps,
+        session_stats=session_stats,
     )
 
     index_path = project_dir / "index.html"
     if not index_path.exists() or html:
         index_path.write_text(html.strip() + "\n", encoding="utf-8")
     logger.info("HTML repaired for session `%s` at `%s`", state.get("session_id", "unknown"), index_path)
-    return {"html_revision_count": state.get("html_revision_count", 0) + 1}
+    return {"html_revision_count": state.get("html_revision_count", 0) + 1, "session_stats": session_stats}
 
 
 def render_node(state: AgentState, *, settings: Settings) -> AgentState:
