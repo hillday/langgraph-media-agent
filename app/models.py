@@ -22,8 +22,8 @@ class AssetPlan(BaseModel):
     prompt: str = ""
     description: str = ""
     target: str
-    duration: int | None = None
-    target_duration: float | None = None
+    duration: int | None = Field(None, description="The integer duration in seconds. Must not be null for video assets. Must be an integer.")
+    target_duration: float | None = Field(None, description="The target duration for the scene. Should be an integer if possible.")
     text: str = ""
     ratio: str | None = None
     use_uploaded_images_as_references: bool = False

@@ -59,6 +59,17 @@ def build_pipeline_payload(
         if asset.type == "video" and asset_source == "local":
             asset_source = "generated_with_reference"
 
+        # Normalize a common planner mistake:
+        # an image intended to reuse an uploaded source gets marked as `generated`
+        # with an empty prompt plus uploaded_image_index. Treat it as `local`.
+        if (
+            asset.type == "image"
+            and asset_source == "generated"
+            and asset.uploaded_image_index is not None
+            and not (asset.prompt or "").strip()
+        ):
+            asset_source = "local"
+
         if asset_source is None:
             if asset.type == "image" and len(used_local_indexes) < len(uploaded_images):
                 asset_source = "local"

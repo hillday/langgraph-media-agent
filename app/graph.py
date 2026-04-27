@@ -335,6 +335,7 @@ Rules:
 - Optimize for balanced generation cost.
 - Prefer image assets over video assets by default. Use images with panning/zooming effects in the HTML to simulate motion.
 - CRITICAL: If the requested video duration is greater than 5 seconds, you MUST include AT LEAST ONE video asset in your plan. Do not make a 10s+ video entirely out of images.
+- CRITICAL: When planning a video asset, you MUST specify its `duration` as an integer. Do not leave it null, and do not use floats. The MINIMUM allowed duration for a video asset is 4. Do not generate video assets shorter than 4 seconds.
 - Use video assets when complex motion is important to communicate the idea (e.g. garment movement, walking, camera motion).
 - Use local asset targets under assets/.
 - If uploaded images exist, prioritize reusing them as direct final image assets wherever reasonable before planning AI image generation.
@@ -342,6 +343,8 @@ Rules:
   - `local`: directly use one uploaded image as the final image asset. Only valid for `type="image"`.
   - `generated`: generate a new asset without uploaded-image references.
   - `generated_with_reference`: generate a new asset using selected uploaded images as references.
+- CRITICAL: If an image asset is meant to reuse an uploaded image as the final visual, you MUST use `asset_source="local"` and set `uploaded_image_index`. Do NOT mark it as `generated`.
+- CRITICAL: If `asset_source` is `generated` or `generated_with_reference` for an image asset, `prompt` MUST be non-empty.
 - When `asset_source` is `local`, set `uploaded_image_index` to the zero-based uploaded image index to use.
 - When `asset_source` is `generated_with_reference`, set `reference_image_indexes` to the specific zero-based uploaded image indexes to reference. Do NOT reference all uploaded images unless they are all truly needed.
 - If the planned image slots exceed the number of uploaded images, only the remaining image slots should require generated images.

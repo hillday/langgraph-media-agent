@@ -3,6 +3,7 @@ import base64
 import json
 import mimetypes
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -18,11 +19,37 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+
+def truncate_log_text(value: str, max_length: int = 400) -> str:
+    if len(value) <= max_length:
+        return value
+    return f"{value[:max_length]}...<truncated>"
+
+
+def sanitize_for_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: sanitize_for_log(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [sanitize_for_log(item) for item in value]
+    if isinstance(value, str):
+        if value.startswith("data:"):
+            prefix, _, rest = value.partition(",")
+            return f"{prefix},<base64:{len(rest)} chars>"
+        return truncate_log_text(value)
+    return value
+
+
+def log_json_event(prefix: str, payload: Any) -> None:
+    try:
+        rendered = json.dumps(sanitize_for_log(payload), ensure_ascii=False)
+    except Exception:
+        rendered = truncate_log_text(repr(payload))
+    print(f"{prefix} {rendered}")
+
 def get_api_key() -> str:
-    # 尝试从指定的环境变量名获取，默认降级到 ARK_API_KEY
-    env_name = os.environ.get("MODEL_API_KEY_ENV", "ARK_API_KEY")
-    # os.environ.get() may return None; keep the type stable for type checkers and runtime.
-    key = (os.environ.get(env_name) or os.environ.get("ARK_API_KEY") or "")
+    # 对于下游的图片/视频生成（BytePlus Ark），必须强制使用 ARK_API_KEY
+    # 不能复用上游 LLM 的 MODEL_API_KEY_ENV，否则会导致鉴权 Key 串台并引发网关断连
+    key = os.environ.get("ARK_API_KEY", "")
     return key.strip()
 
 def load_pipeline(path: Path) -> dict[str, Any]:
@@ -31,7 +58,7 @@ def load_pipeline(path: Path) -> dict[str, Any]:
 def ensure_api_key() -> str:
     key = get_api_key()
     if not key:
-        raise RuntimeError(f"Missing API Key in environment (checked {os.environ.get('MODEL_API_KEY_ENV', 'ARK_API_KEY')} and ARK_API_KEY).")
+        raise RuntimeError("Missing API Key in environment (checked ARK_API_KEY).")
     return key
 
 
@@ -50,6 +77,13 @@ def raise_for_status_with_hint(response: requests.Response, context: str) -> Non
     response.raise_for_status()
 
 
+def summarize_exception(exc: Exception) -> str:
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        details = exc.response.text[:800].strip()
+        return f"HTTP {exc.response.status_code} {exc.response.reason}. Response: {details}"
+    return str(exc)
+
+
 def request_with_retry(
     method: str,
     url: str,
@@ -64,7 +98,11 @@ def request_with_retry(
 
     for attempt in range(1, attempts + 1):
         try:
+            # Use the top-level requests API (similar to requests.post/get in seedance_video_gen.py).
+            # This avoids keeping/reusing a Session connection pool across attempts.
             response = requests.request(method, url, **kwargs)
+            # Provide better errors for auth failures and fail fast on HTTP 4xx/5xx.
+            raise_for_status_with_hint(response, context)
             if response.status_code not in expected_status_codes:
                 details = response.text[:800].strip()
                 raise RuntimeError(
@@ -72,7 +110,14 @@ def request_with_retry(
                     f"Expected {expected_status_codes}. Response: {details}"
                 )
             return response
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.SSLError,
+        ) as exc:
+            last_error = exc
+        except requests.exceptions.HTTPError as exc:
+            # 捕获 HTTPError 并允许 4xx 和 5xx 都进入重试队列
             last_error = exc
         except RuntimeError as exc:
             last_error = exc
@@ -80,11 +125,17 @@ def request_with_retry(
         if attempt == attempts:
             break
 
-        sleep_seconds = backoff_seconds * attempt
-        print(f"[RETRY] {context} attempt {attempt}/{attempts} failed, retrying in {sleep_seconds:.1f}s")
+        # Add jitter to avoid synchronized retries when running in a pool.
+        sleep_seconds = (backoff_seconds * attempt) + random.random()
+        err_name = type(last_error).__name__ if last_error else "UnknownError"
+        err_summary = summarize_exception(last_error) if last_error else ""
+        print(
+            f"[RETRY] {context} attempt {attempt}/{attempts} failed ({err_name}): {truncate_log_text(err_summary, 300)}, retrying in {sleep_seconds:.1f}s"
+        )
         time.sleep(sleep_seconds)
 
-    raise RuntimeError(f"{context} failed after {attempts} attempts") from last_error
+    error_summary = summarize_exception(last_error) if last_error else "Unknown error"
+    raise RuntimeError(f"{context} failed after {attempts} attempts. Last error: {error_summary}") from last_error
 
 
 def download_file(url: str, output_path: Path) -> None:
@@ -142,9 +193,14 @@ def generate_image(asset: dict[str, Any], provider: dict[str, Any], output_root:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {ensure_api_key()}",
     }
+    prompt = str(asset.get("prompt") or "").strip()
+    if not prompt:
+        # Fallback for empty prompt to prevent API 400 Bad Request
+        prompt = "Product showcase, clean and premium style, highly detailed"
+        
     payload = {
         "model": provider["model"],
-        "prompt": asset["prompt"],
+        "prompt": prompt,
         "size": provider.get("size", "2K"),
         "output_format": provider.get("output_format", "png"),
         "watermark": provider.get("watermark", False),
@@ -154,6 +210,10 @@ def generate_image(asset: dict[str, Any], provider: dict[str, Any], output_root:
         payload["image"] = [normalize_image_ref(image_ref, base_dir) for image_ref in reference_images]
         payload["sequential_image_generation"] = "disabled"
 
+    log_json_event(
+        f"[IMAGE][REQUEST] asset={asset['id']} endpoint={provider['endpoint']}",
+        payload,
+    )
     response = request_with_retry(
         "POST",
         provider["endpoint"],
@@ -161,10 +221,14 @@ def generate_image(asset: dict[str, Any], provider: dict[str, Any], output_root:
         headers=headers,
         json=payload,
         timeout=300,
-        attempts=3,
+        attempts=5,
         backoff_seconds=3.0,
     )
     body = response.json()
+    log_json_event(
+        f"[IMAGE][RESPONSE] asset={asset['id']} status={response.status_code}",
+        body,
+    )
     data = body.get("data", [])
     if not data or not data[0].get("url"):
         raise RuntimeError(f"Image generation returned no downloadable URL for asset {asset['id']}")
@@ -175,6 +239,18 @@ def generate_image(asset: dict[str, Any], provider: dict[str, Any], output_root:
 
 def create_video_request(asset: dict[str, Any], provider: dict[str, Any], base_dir: Path) -> dict[str, Any]:
     content: list[dict[str, Any]] = [{"type": "text", "text": asset["prompt"]}]
+    resolved_duration_raw = asset.get("duration") or asset.get("target_duration") or provider.get("duration", 5)
+    
+    # BytePlus Ark video generation API requires an integer duration.
+    # OpenRouter may generate null or float (e.g. 3.5), which will cause HTTP 400 Bad Request.
+    # The minimum allowed duration for this model is 4.
+    try:
+        resolved_duration = int(round(float(resolved_duration_raw)))
+        if resolved_duration < 4:
+            resolved_duration = 4
+    except (TypeError, ValueError):
+        resolved_duration = 5
+
 
     first_image = asset.get("first_image")
     use_references = asset.get("asset_source") == "generated_with_reference"
@@ -218,20 +294,25 @@ def create_video_request(asset: dict[str, Any], provider: dict[str, Any], base_d
         "content": content,
         "generate_audio": provider.get("generate_audio", False),
         "ratio": asset.get("ratio", provider.get("ratio", "16:9")),
-        "duration": asset.get("duration", provider.get("duration", 5)),
+        "duration": resolved_duration,
         "watermark": provider.get("watermark", False),
     }
-
-
 def poll_video_task(provider: dict[str, Any], task_id: str) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {ensure_api_key()}"}
     status_url = f"{provider['status_endpoint_base'].rstrip('/')}/{task_id}"
+    last_status: Any = None
 
     for _ in range(180):
         response = requests.request("GET", status_url, headers=headers, timeout=30)
         raise_for_status_with_hint(response, f"Video task polling ({task_id})")
         body = response.json()
         status = body.get("status")
+        if status != last_status:
+            log_json_event(
+                f"[VIDEO][POLL] task_id={task_id} status={status} status_code={response.status_code} url={status_url}",
+                body,
+            )
+            last_status = status
         if status == "succeeded":
             return body
         if status == "failed":
@@ -266,36 +347,34 @@ def generate_video(asset: dict[str, Any], provider: dict[str, Any], output_root:
         "Authorization": f"Bearer {ensure_api_key()}",
     }
     payload = create_video_request(asset, provider, base_dir)
-    last_error: Exception | None = None
+    log_json_event(
+        f"[VIDEO][REQUEST] asset={asset['id']} endpoint={provider['endpoint']}",
+        payload,
+    )
+    response = request_with_retry(
+        "POST",
+        provider["endpoint"],
+        context=f"Video task creation ({asset['id']})",
+        headers=headers,
+        json=payload,
+        timeout=30,
+        attempts=5,
+        backoff_seconds=3.0,
+    )
+    raise_for_status_with_hint(response, f"Video task creation ({asset['id']})")
+    task_info = response.json()
+    log_json_event(
+        f"[VIDEO][RESPONSE] asset={asset['id']} status={response.status_code}",
+        task_info,
+    )
+    task_id = task_info.get("id")
+    if not task_id:
+        raise RuntimeError(f"Video task creation returned no task id: {json.dumps(task_info)}")
 
-    for attempt in range(1, 4):
-        try:
-            response = requests.request(
-                "POST",
-                provider["endpoint"],
-                headers=headers,
-                json=payload,
-                timeout=30,
-            )
-            raise_for_status_with_hint(response, f"Video task creation ({asset['id']})")
-            task_info = response.json()
-            task_id = task_info.get("id")
-            if not task_id:
-                raise RuntimeError(f"Video task creation returned no task id: {json.dumps(task_info)}")
-
-            result = poll_video_task(provider, task_id)
-            video_url = extract_video_url(result)
-            download_file(video_url, target)
-            return target
-        except Exception as exc:
-            last_error = exc
-            if attempt == 3:
-                break
-            sleep_seconds = 3.0 * attempt
-            print(f"[RETRY] Video generation ({asset['id']}) draw {attempt}/3 failed, retrying in {sleep_seconds:.1f}s")
-            time.sleep(sleep_seconds)
-
-    raise RuntimeError(f"Video generation failed after 3 draws for asset {asset['id']}") from last_error
+    result = poll_video_task(provider, task_id)
+    video_url = extract_video_url(result)
+    download_file(video_url, target)
+    return target
 
 
 def ensure_tts_credentials(provider: dict[str, Any]) -> None:
@@ -447,7 +526,16 @@ def resolve_assets(pipeline: dict[str, Any], output_root: Path, base_dir: Path) 
     resolved: dict[str, dict[str, Any]] = {}
     providers = pipeline["providers"]
     total = len(pipeline["assets"])
-    max_workers = min(len(pipeline["assets"]), 4) or 1
+    # Allow forcing serial execution to reduce network/TLS flakiness during debugging.
+    # Default keeps prior behavior (up to 4 workers).
+    try:
+        requested_workers = int(os.environ.get("MEDIA_MAX_WORKERS", "4"))
+    except Exception:
+        requested_workers = 4
+    requested_workers = max(1, min(requested_workers, 8))
+    max_workers = min(total, requested_workers) or 1
+    if max_workers == 1:
+        print("[CONFIG] MEDIA_MAX_WORKERS=1 -> running asset generation in serial mode")
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(resolve_single_asset, asset, providers, output_root, base_dir, idx, total): asset["id"]
