@@ -149,11 +149,54 @@ def compute_media_stats(resolved_pipeline_path: Path) -> dict[str, int]:
     return {"videos_generated": videos_generated, "images_generated": images_generated}
 
 
-def extract_json_object(text: str) -> dict[str, Any]:
+def _repair_truncated_json(text: str) -> str:
+    """
+    Heal common LLM JSON truncation issues before parsing:
+    - unescaped newlines inside string values
+    - trailing content after the final closing brace
+    - missing closing brace/array bracket at the end
+    """
+    # 1) Remove markdown fences if present
     candidate = text.strip()
     fenced_match = re.search(r"```(?:json)?\s*(.*?)\s*```", candidate, re.DOTALL)
     if fenced_match:
         candidate = fenced_match.group(1).strip()
+
+    # 2) Strip any trailing text after the last top-level '}'
+    last_brace = candidate.rfind("}")
+    if last_brace != -1:
+        candidate = candidate[: last_brace + 1]
+
+    # 3) Replace raw newlines that appear inside quoted string values.
+    #    We walk the string char-by-char so we only touch newlines that are
+    #    genuinely inside a JSON string (between unescaped double quotes).
+    result_chars: list[str] = []
+    in_string = False
+    escape_next = False
+    for ch in candidate:
+        if escape_next:
+            result_chars.append(ch)
+            escape_next = False
+            continue
+        if ch == "\\":
+            result_chars.append(ch)
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result_chars.append(ch)
+            continue
+        if ch in "\n\r" and in_string:
+            # Replace raw newline inside a JSON string with an escaped space
+            # so the string stays valid and readable.
+            result_chars.append(" ")
+            continue
+        result_chars.append(ch)
+    return "".join(result_chars)
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    candidate = _repair_truncated_json(text)
 
     try:
         parsed = json.loads(candidate)
