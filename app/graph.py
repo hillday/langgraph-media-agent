@@ -754,6 +754,8 @@ Requirements:
 - HARD CONSTRAINT: Do NOT nest a playing `<video>` as an untimed background inside a separately timed scene pattern that assumes the browser starts playback on load. Use the video itself as the timed clip, or place it inside a non-timed wrapper while timing is carried by the media node.
 - HARD CONSTRAINT: Do NOT add a global background-music `<audio>` element, and do NOT use `<audio src="...mp4">`.
 - HARD CONSTRAINT: Scene narration audio should use normal timed `<audio>` elements with local `./assets/...` paths and their own `data-start`, `data-duration`, and `data-track-index`.
+- HARD CONSTRAINT: Do NOT animate `visibility`/`display`/`autoAlpha` on any element that has the `clip` class (scene containers and timed media). The HyperFrames runtime manages clip visibility; only animate child layers inside a clip.
+- HARD CONSTRAINT: Do NOT set `data-has-audio="true"` on any `<video>` element that is `muted`. If a scene must be audible, use a separate timed `<audio>` element.
 - HARD CONSTRAINT: Do NOT call `play()`, `pause()`, or force media sync by repeatedly setting `currentTime` inside GSAP `onUpdate`. The runtime owns media playback.
 - HARD CONSTRAINT: Do NOT use non-deterministic code such as `Date`, `new Date()`, `Math.random()`, timers that change output across runs, or runtime-generated IDs.
 - HARD CONSTRAINT: Prefer `loop` for short visual video backgrounds when needed. Do NOT add `autoplay` or custom `video.play()` bootstrap code in the generated HTML.
@@ -845,7 +847,13 @@ def validate_router(state: AgentState) -> str:
         or re.search(r"\bfailed\b", text)
         or ("✗" in text)
     )
-    if has_nonzero_errors:
+    # Some validators emit machine-readable issues as `error: ...` lines even when the summary says `0 error(s)`.
+    has_error_lines = bool(re.search(r"(?m)^\s*error:\s+", text))
+
+    # HyperFrames StaticGuard contract violations are always blocking.
+    has_staticguard_contract_violation = ("staticguard" in text) or ("invalid hyperframe contract" in text)
+
+    if has_nonzero_errors or has_error_lines or has_staticguard_contract_violation:
         if state.get("html_revision_count", 0) < 1:
             return "repair_html"
         return "fail"
@@ -882,6 +890,8 @@ Return final HTML only if you are not already writing it with write_file.
 - Remove any non-deterministic code such as `Date`, `new Date()`, `Math.random()`, or runtime-generated IDs.
 - Do NOT add `autoplay` or custom `video.play()` bootstrap code during repair unless the user explicitly asks for that behavior.
 - Keep `<video>` muted unless the project intentionally introduces a separate timed audio track.
+- Do NOT set `data-has-audio="true"` on muted `<video>` elements. If a scene must be audible, add a separate timed `<audio>` element instead.
+- Do NOT animate `visibility`/`display`/`autoAlpha` on any `clip` element (scene containers and timed media). The runtime owns clip visibility; only animate inner layers.
 - Repair any hidden-text bug where readable copy stays at CSS `opacity:0` or where CSS-hidden text is paired with `gsap.from(... opacity:0 ...)`.
 - Prefer visible default text plus motion, or explicit `fromTo` / `to` tweens that end at `opacity:1`.
 """
