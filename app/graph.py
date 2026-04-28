@@ -264,6 +264,27 @@ def detect_text_visibility_risks(html: str) -> list[str]:
     return risks
 
 
+def detect_missing_local_asset_refs(html: str, project_dir: Path) -> list[str]:
+    missing: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"""<(?:img|video|audio)\b[^>]*\bsrc=["']([^"']+)["']""", html, re.IGNORECASE):
+        src = match.group(1).strip()
+        if not src:
+            continue
+        if src.startswith(("http://", "https://", "data:", "//")):
+            continue
+        normalized = src[2:] if src.startswith("./") else src
+        if normalized.startswith("/"):
+            normalized = normalized[1:]
+        if not normalized:
+            continue
+        target = project_dir / normalized.replace("/", os.sep)
+        if not target.exists() and src not in seen:
+            missing.append(f'asset_src_not_found: "{src}" does not exist under the project directory')
+            seen.add(src)
+    return missing
+
+
 def image_path_to_data_url(image_path: str) -> str:
     file_path = Path(image_path).resolve()
     if not file_path.exists():
@@ -708,6 +729,8 @@ Requirements:
 - Output only final HTML
 - Use HyperFrames-compatible root composition rules
 - Use local assets only from the resolved pipeline
+- Use only the exact local media files that already exist in the resolved pipeline. Do NOT invent, rename, or guess `./assets/...` file names.
+- For scene visuals, prefer the exact `resolved_asset_path` values from the resolved pipeline. For narration, prefer the exact `resolved_audio_path` values from the resolved pipeline.
 - Include text, transitions, and visual effects
 - Include separate timed `<audio>` elements for narration assets when present in the resolved pipeline
 - Ensure every scene has audible content. Image scenes should usually use TTS narration; video scenes without TTS should still expose the video's native sound through a separate timed `<audio>` element sourced from the same local media or an extracted local audio file.
@@ -807,6 +830,7 @@ def validate_html_node(state: AgentState, *, settings: Settings) -> AgentState:
         }
     html_text = index_path.read_text(encoding="utf-8")
     text_visibility_risks = detect_text_visibility_risks(html_text)
+    missing_asset_risks = detect_missing_local_asset_refs(html_text, project_dir)
     try:
         lint_result = run_hyperframes_command(settings, ["lint", str(project_dir)], project_dir, check=False)
         lint_output = (lint_result.stdout or "") + (lint_result.stderr or "")
@@ -826,6 +850,9 @@ def validate_html_node(state: AgentState, *, settings: Settings) -> AgentState:
         logger.exception("Validate command failed for session `%s`", state.get("session_id", "unknown"))
     if text_visibility_risks:
         risk_output = "\n".join(f"error: {risk}" for risk in text_visibility_risks)
+        validate_output = ((validate_output.rstrip() + "\n") if validate_output.strip() else "") + risk_output
+    if missing_asset_risks:
+        risk_output = "\n".join(f"error: {risk}" for risk in missing_asset_risks)
         validate_output = ((validate_output.rstrip() + "\n") if validate_output.strip() else "") + risk_output
     logger.debug("Lint output for session `%s`\n%s", state.get("session_id", "unknown"), lint_output)
     logger.debug("Validate output for session `%s`\n%s", state.get("session_id", "unknown"), validate_output)
@@ -892,6 +919,7 @@ Return final HTML only if you are not already writing it with write_file.
 - Keep `<video>` muted unless the project intentionally introduces a separate timed audio track.
 - Do NOT set `data-has-audio="true"` on muted `<video>` elements. If a scene must be audible, add a separate timed `<audio>` element instead.
 - Do NOT animate `visibility`/`display`/`autoAlpha` on any `clip` element (scene containers and timed media). The runtime owns clip visibility; only animate inner layers.
+- Do NOT invent or rename local asset paths during repair. If lint/validate reports a missing `src`, fix the HTML by aligning it to the exact existing `resolved_asset_path` / `resolved_audio_path` from the resolved pipeline.
 - Repair any hidden-text bug where readable copy stays at CSS `opacity:0` or where CSS-hidden text is paired with `gsap.from(... opacity:0 ...)`.
 - Prefer visible default text plus motion, or explicit `fromTo` / `to` tweens that end at `opacity:1`.
 """
