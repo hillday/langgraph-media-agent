@@ -117,3 +117,21 @@ class SkillRegistry:
                 f"## Skill: {skill.name}\nPath: {skill.path}\nDescription: {skill.description}\nReferenced docs: {referenced_docs}\n\n{skill.expanded_body}"
             )
         return "\n\n".join(sections)
+
+    def build_slim_context(self, selected_skills: list[str]) -> tuple[str, list[str]]:
+        """Return (slim_context, ref_paths) where slim_context contains only SKILL.md bodies
+        (no auto-embedded referenced docs) and ref_paths lists the available reference doc paths
+        for on-demand reading via read_file tool."""
+        sections: list[str] = []
+        ref_paths: list[str] = []
+        for skill_name in selected_skills:
+            skill = self.get(skill_name)
+            if not skill:
+                continue
+            sections.append(
+                f"## Skill: {skill.name}\nPath: {skill.path}\nDescription: {skill.description}\n\n{skill.body}"
+            )
+            for path in skill.referenced_paths:
+                rel = path.relative_to(skill.path.parent).as_posix()
+                ref_paths.append(f"  - {rel}: {path}")
+        return "\n\n".join(sections), ref_paths

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -74,6 +75,61 @@ def _message_to_log_dict(message: Any) -> dict[str, Any]:
         "tool_calls": getattr(message, "tool_calls", None),
         "additional_kwargs": getattr(message, "additional_kwargs", None),
     }
+
+
+def _is_retryable_llm_exception(exc: Exception) -> bool:
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    exc_name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    retry_markers = (
+        "bad gateway",
+        "gateway timeout",
+        "service unavailable",
+        "temporarily unavailable",
+        "connection reset",
+        "remoteprotocolerror",
+        "readtimeout",
+        "connecttimeout",
+        "timed out",
+        "expecting value",
+    )
+    return "jsondecodeerror" in exc_name or any(marker in message for marker in retry_markers)
+
+
+def _invoke_llm_with_retries(
+    llm: Any,
+    messages: list[Any],
+    *,
+    operation: str,
+    max_attempts: int = 3,
+    base_delay_seconds: float = 1.0,
+) -> Any:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return llm.invoke(messages)
+        except Exception as exc:
+            retryable = _is_retryable_llm_exception(exc)
+            if not retryable or attempt >= max_attempts:
+                logger.exception(
+                    "LLM invoke failed for %s on attempt %s/%s (retryable=%s)",
+                    operation,
+                    attempt,
+                    max_attempts,
+                    retryable,
+                )
+                raise
+            delay_seconds = base_delay_seconds * attempt
+            logger.warning(
+                "LLM invoke failed for %s on attempt %s/%s with retryable error %s: %s; retrying in %.1fs",
+                operation,
+                attempt,
+                max_attempts,
+                exc.__class__.__name__,
+                exc,
+                delay_seconds,
+            )
+            time.sleep(delay_seconds)
 
 
 def empty_session_stats() -> dict[str, Any]:
@@ -229,26 +285,99 @@ def extract_html_document(text: str) -> str:
     raise ValueError("Model response does not contain a complete HTML document.")
 
 
+def auto_fix_html_violations(html: str) -> str:
+    """Deterministically fix known mechanical HyperFrames violations that don't require LLM judgment."""
+    # 1. Remove data-has-audio="true" from any <video> element (all videos are muted).
+    html = re.sub(
+        r'(<video\b[^>]*?)\s+data-has-audio=(?:"true"|\'true\')([^>]*>)',
+        r'\1\2',
+        html,
+        flags=re.IGNORECASE,
+    )
+
+    # 2. Strip timing attributes from <video> elements nested inside a timed <section>.
+    #    HyperFrames forbids a video with data-start inside another timed element
+    #    (video_nested_in_timed_element → video is FROZEN in renders).
+    #    The parent <section> already carries clip timing; the video is a plain visual fill.
+    def _strip_timing_from_nested_video(section_match: re.Match) -> str:
+        open_tag = section_match.group(1)
+        body = section_match.group(2)
+
+        def _strip_video(video_match: re.Match) -> str:
+            tag = video_match.group(0)
+            # Only strip timing if this video actually has data-start (i.e., was incorrectly timed)
+            if not re.search(r'\bdata-start=', tag, re.IGNORECASE):
+                return tag
+            tag = re.sub(r'\s+data-start=(?:"[^"]*"|\'[^\']*\')', '', tag, flags=re.IGNORECASE)
+            tag = re.sub(r'\s+data-duration=(?:"[^"]*"|\'[^\']*\')', '', tag, flags=re.IGNORECASE)
+            tag = re.sub(r'\s+data-track-index=(?:"[^"]*"|\'[^\']*\')', '', tag, flags=re.IGNORECASE)
+            # Remove 'clip' from class but preserve other classes
+            tag = re.sub(r'\bclip\s*', '', tag)
+            tag = re.sub(r'class="\s*"', '', tag)
+            return tag
+
+        fixed_body = re.sub(
+            r'<video\b[^>]*>',
+            _strip_video,
+            body,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return f"{open_tag}{fixed_body}</section>"
+
+    html = re.sub(
+        r'(<section\b[^>]*\bdata-start=(?:"[^"]*"|\'[^\']*\')[^>]*>)([\s\S]*?)</section>',
+        _strip_timing_from_nested_video,
+        html,
+        flags=re.IGNORECASE,
+    )
+
+    return html
+
+
 def detect_text_visibility_risks(html: str) -> list[str]:
+    # Match opacity strictly equal to 0 (not 0.x).  The negative lookahead (?![.\d])
+    # ensures we don't match opacity: 0.3, 0.98, etc.
+    _OP_ZERO = r"opacity\s*:\s*0(?![.\d])"
+
+    # Extract only content inside <style>...</style> blocks for CSS checks,
+    # to avoid false-positives from matching GSAP JS object literals.
+    style_blocks = re.findall(r"<style\b[^>]*>(.*?)</style>", html, re.IGNORECASE | re.DOTALL)
+    css_only = "\n".join(style_blocks)
+
     risks: list[str] = []
     css_hidden_text_patterns = [
-        r"\.(?:kicker|title|body|point|copy|headline|subtitle|caption|cta)\b[^{}]*\{[^{}]*opacity\s*:\s*0\b",
-        r"(?:^|[,{])\s*(?:h1|h2|h3|h4|p|li|span)\b[^{}]*\{[^{}]*opacity\s*:\s*0\b",
+        rf"\.(?:kicker|title|body|point|copy|headline|subtitle|caption|cta)\b[^{{}}]*\{{[^{{}}]*{_OP_ZERO}",
+        rf"(?:^|[,{{])\s*(?:h1|h2|h3|h4|p|li|span)\b[^{{}}]*\{{[^{{}}]*{_OP_ZERO}",
     ]
-    has_hidden_text_css = any(re.search(pattern, html, re.IGNORECASE | re.DOTALL | re.MULTILINE) for pattern in css_hidden_text_patterns)
-    has_from_opacity_zero = bool(re.search(r"\b(?:gsap|tl)\.from(?:To)?\s*\([\s\S]*?opacity\s*:\s*0\b", html, re.IGNORECASE))
+    has_hidden_text_css = bool(css_only) and any(
+        re.search(pattern, css_only, re.IGNORECASE | re.DOTALL | re.MULTILINE) for pattern in css_hidden_text_patterns
+    )
+    has_from_opacity_zero = bool(re.search(rf"\b(?:gsap|tl)\.from(?:To)?\s*\([\s\S]*?{_OP_ZERO}", html, re.IGNORECASE))
+    has_text_from_opacity_zero = bool(
+        re.search(
+            rf"\b(?:gsap|tl)\.from\s*\(\s*(?:\[[^\]]*(?:kicker|title|body|point|copy|headline|subtitle|caption|cta|vo|note|pill)[^\]]*\]|['\"][^'\"]*(?:kicker|title|body|point|copy|headline|subtitle|caption|cta|vo|note|pill)[^'\"]*['\"])\s*,[\s\S]*?{_OP_ZERO}",
+            html,
+            re.IGNORECASE,
+        )
+    )
     has_from_to_opacity_one = bool(
         re.search(
-            r"\b(?:gsap|tl)\.fromTo\s*\([\s\S]*?\{[\s\S]*?opacity\s*:\s*0\b[\s\S]*?\}\s*,\s*\{[\s\S]*?opacity\s*:\s*1\b",
+            rf"\b(?:gsap|tl)\.fromTo\s*\([\s\S]*?\{{[\s\S]*?{_OP_ZERO}[\s\S]*?\}}\s*,\s*\{{[\s\S]*?opacity\s*:\s*1\b",
             html,
             re.IGNORECASE,
         )
     )
 
-    if has_hidden_text_css and re.search(r"\b(?:gsap|tl)\.from\s*\([\s\S]*?opacity\s*:\s*0\b", html, re.IGNORECASE):
+    if has_hidden_text_css and re.search(rf"\b(?:gsap|tl)\.from\s*\([\s\S]*?{_OP_ZERO}", html, re.IGNORECASE):
         risks.append(
             "text_visibility_risk: text-like CSS selectors default to opacity:0 while GSAP uses from(... opacity:0 ...); "
             "this usually animates from invisible to invisible, so rendered text never appears"
+        )
+
+    if has_text_from_opacity_zero:
+        risks.append(
+            "text_visibility_risk: readable text uses gsap/timeline from(... opacity:0 ...). Default text should remain visible; "
+            "use visible base styles plus motion, or fromTo(... opacity:0 -> 1 ...)"
         )
 
     if has_hidden_text_css and not has_from_to_opacity_one:
@@ -283,6 +412,32 @@ def detect_missing_local_asset_refs(html: str, project_dir: Path) -> list[str]:
             missing.append(f'asset_src_not_found: "{src}" does not exist under the project directory')
             seen.add(src)
     return missing
+
+
+def describe_html_snapshot(index_path: Path, html_text: str) -> dict[str, Any]:
+    stat = index_path.stat()
+    video_match = re.search(r"""<video\b[^>]*\bid=["'](?:scene3-media|s3-media)["'][^>]*>""", html_text, re.IGNORECASE)
+    if not video_match:
+        video_match = re.search(r"""<video\b[^>]*>""", html_text, re.IGNORECASE)
+    body_opacity_zero = bool(re.search(r"""\.body\b[^{}]*\{[^{}]*opacity\s*:\s*0\b""", html_text, re.IGNORECASE | re.DOTALL))
+    title_opacity_zero = bool(re.search(r"""\.title\b[^{}]*\{[^{}]*opacity\s*:\s*0\b""", html_text, re.IGNORECASE | re.DOTALL))
+    text_from_opacity_zero = bool(
+        re.search(
+            r"\b(?:gsap|tl)\.from\s*\(\s*(?:\[[^\]]*(?:kicker|title|body|point|copy|headline|subtitle|caption|cta|vo|note|pill)[^\]]*\]|['\"][^'\"]*(?:kicker|title|body|point|copy|headline|subtitle|caption|cta|vo|note|pill)[^'\"]*['\"])\s*,[\s\S]*?opacity\s*:\s*0\b",
+            html_text,
+            re.IGNORECASE,
+        )
+    )
+    return {
+        "path": str(index_path),
+        "mtime_epoch": round(stat.st_mtime, 3),
+        "size_bytes": stat.st_size,
+        "sha256": hashlib.sha256(html_text.encode("utf-8")).hexdigest(),
+        "scene3_media_tag": video_match.group(0) if video_match else "",
+        "has_data_has_audio_true": 'data-has-audio="true"' in html_text or "data-has-audio='true'" in html_text,
+        "has_text_css_opacity_zero": body_opacity_zero or title_opacity_zero,
+        "has_text_from_opacity_zero": text_from_opacity_zero,
+    }
 
 
 def image_path_to_data_url(image_path: str) -> str:
@@ -347,7 +502,11 @@ Return only a valid JSON object.
         _serialize_for_log([_message_to_log_dict(message) for message in messages]),
     )
     try:
-        response = model.invoke(messages)
+        response = _invoke_llm_with_retries(
+            model,
+            messages,
+            operation=f"invoke_json_prompt:{schema.__name__}",
+        )
         if session_stats is not None:
             record_llm_token_usage(session_stats, response)
         raw_content = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
@@ -394,7 +553,11 @@ def run_file_tool_authoring_loop(
             step_index + 1,
             _serialize_for_log([_message_to_log_dict(message) for message in messages]),
         )
-        response = llm.invoke(messages)
+        response = _invoke_llm_with_retries(
+            llm,
+            messages,
+            operation=f"run_file_tool_authoring_loop:step_{step_index + 1}",
+        )
         if session_stats is not None:
             record_llm_token_usage(session_stats, response)
         logger.debug(
@@ -447,6 +610,68 @@ def run_file_tool_authoring_loop(
     raise RuntimeError("Tool-calling authoring loop exceeded the maximum number of steps.")
 
 
+def run_direct_html_authoring_loop(
+    *,
+    model: Any,
+    system_prompt: str,
+    user_prompt: str,
+    current_html: str,
+    max_attempts: int = 3,
+    session_stats: dict[str, Any] | None = None,
+) -> str:
+    logger.info("Starting direct HTML authoring fallback without tools")
+    fallback_system_prompt = (
+        system_prompt
+        + "\n\nTool fallback mode: file tools are unavailable for this request. "
+        + "Work only from the provided HTML/pipeline/brief context and return the complete final HTML document."
+    )
+    fallback_user_prompt = (
+        user_prompt
+        + "\n\nCurrent `index.html` to enhance:\n```html\n"
+        + current_html
+        + "\n```"
+        + "\n\nReturn only the complete final HTML document."
+    )
+    messages: list[Any] = [SystemMessage(content=fallback_system_prompt), HumanMessage(content=fallback_user_prompt)]
+
+    for attempt in range(1, max_attempts + 1):
+        logger.debug(
+            "LLM request `run_direct_html_authoring_loop` attempt=%s messages=\n%s",
+            attempt,
+            _serialize_for_log([_message_to_log_dict(message) for message in messages]),
+        )
+        response = _invoke_llm_with_retries(
+            model,
+            messages,
+            operation=f"run_direct_html_authoring_loop:attempt_{attempt}",
+        )
+        if session_stats is not None:
+            record_llm_token_usage(session_stats, response)
+        logger.debug(
+            "LLM response `run_direct_html_authoring_loop` attempt=%s\n%s",
+            attempt,
+            _serialize_for_log(_message_to_log_dict(response)),
+        )
+        content_str = str(response.content).strip()
+        try:
+            html_doc = extract_html_document(content_str)
+            logger.info("Direct HTML authoring fallback finished on attempt=%s", attempt)
+            return html_doc
+        except ValueError as exc:
+            logger.warning("Direct HTML authoring fallback returned invalid HTML on attempt=%s: %s", attempt, exc)
+            messages.append(response)
+            messages.append(
+                HumanMessage(
+                    content=(
+                        "Your response did not contain a complete valid HTML document. "
+                        "Return only the full final HTML code starting with <!doctype html> or <html>."
+                    )
+                )
+            )
+
+    raise RuntimeError("Direct HTML authoring fallback exceeded the maximum number of attempts.")
+
+
 def planner_node(state: AgentState, *, settings: Settings, registry: SkillRegistry, model: Any) -> AgentState:
     logger.info("Entering planner node for session `%s`", state.get("session_id", "unknown"))
     session_stats = normalize_session_stats(state.get("session_stats"))
@@ -470,8 +695,8 @@ Rules:
 - Ask clarification only if truly necessary.
 - Always include hyperframes-media-pipeline and hyperframes in selected_skills.
 - Use ONE asset per scene. Do NOT plan separate background and hero assets.
-- Only plan narration audio for image scenes that would otherwise be silent. Video scenes should rely on the video's own sound and should NOT get extra narration audio by default.
-- Every scene should have audible content. Image scenes should usually use TTS narration; video scenes should usually rely on the video's native audio rather than extra TTS dubbing.
+- Only plan narration audio for image scenes that would otherwise be silent. Video scenes should rely on extracted native video audio by default and should NOT get extra narration audio unless the user explicitly asks for dubbing.
+- Every scene should have audible content. Image scenes should usually use TTS narration; video scenes should usually rely on an extracted local audio track from the generated video rather than extra TTS dubbing.
 - Plan shorter scenes (2-4 seconds each) to make the video feel dynamic. A 15s video should have 4-6 scenes.
 - Plan enough assets to cover all scenes. Each scene gets exactly one asset (either image or video).
 - If a scene uses an image asset, you should usually include a matching audio asset with concise spoken text.
@@ -513,7 +738,7 @@ Rules:
   - set `audio_asset_id` only for image scenes that need narration
   - set `voiceover_text` to the concise spoken text that should be heard in that scene
   - keep `voiceover_text` semantically aligned with the scene's visible copy
-- If a scene uses a video asset and has no `audio_asset_id`, that means the final HTML should preserve audible video sound for that scene via a separate timed audio track sourced from the same local media or its extracted local audio, not via extra TTS.
+- If a scene uses a video asset and has no `audio_asset_id`, that means the final HTML should use a separate timed audio track sourced from the generated video's extracted local audio file, not embedded `<video>` audio and not extra TTS.
 - Audio assets are generated by TTS, not uploaded images, so do not use `asset_source="local"` for audio assets.
 """
     try:
@@ -618,24 +843,26 @@ def verify_assets_node(state: AgentState, *, model: Any) -> AgentState:
         model,
         f"""
 You are the verifier in a planner/executor/verifier loop.
-Check whether the asset stage produced enough information for HyperFrames HTML authoring.
+Inspect the resolved pipeline and decide whether asset generation succeeded well enough to proceed to HTML authoring.
 
-Pay special attention to these failure modes before allowing HTML authoring:
-- scene copy is too weak, missing, or not specific enough for readable on-screen text
-- scene timing does not cover the requested runtime continuously, including gaps, empty tail duration, or bad end-time alignment
-- the resolved pipeline structure is likely to produce fragile HTML timing/layering, such as scenes without clear media coverage, scenes without meaningful copy, or media/text wiring that would likely cause later scenes to be visually hidden
-- one or more scenes would likely end up silent, especially video scenes that have no explicit narration asset and would need native video sound preserved through a separate timed audio track
-- the planned HTML structure would likely separate full-screen media and text into fragile top-level sibling tracks instead of keeping media + overlay + text together inside each scene
-- the likely HTML pattern would use top-level sibling media strips instead of self-contained per-scene blocks, increasing the risk of missing text and black frames
-- a video scene would likely depend on page-load playback, initial hidden state, or a one-off GSAP reveal instead of deterministic runtime-timed visibility and audio playback during its scheduled window
+Default to `continue`. Only return `replan_required` or `blocked` when there is a concrete, observable problem in the resolved pipeline data itself — not a prediction about future HTML quality.
+
+Return `replan_required` only if:
+- One or more assets have `resolved: false` (generation failed) AND the missing asset is required for a scene
+- Scene timing has obvious gaps (a scene ends before the next starts with no coverage) or the total covered duration is significantly shorter than the planned composition duration
+- A required audio asset has no resolved path and leaves an image scene completely silent with no fallback
+
+Return `blocked` only if:
+- Asset generation clearly crashed or produced no usable output at all
+
+Return `continue` in all other cases, including:
+- Scene copy that could be stronger (HTML authoring will handle this)
+- Aesthetic or structural concerns about future HTML layout (HTML authoring and validation handle this)
+- Video scenes without explicit narration (they will use extracted audio in HTML)
+- Minor timing imprecision that is within 1-2 seconds
 
 Resolved pipeline:
 {resolved_pipeline}
-
-Return:
-- continue if assets and scenes are sufficient
-- replan_required if the plan itself should change
-- blocked if generation clearly failed
 """,
         VerificationResult,
         session_stats=session_stats,
@@ -657,6 +884,27 @@ def verification_router(state: AgentState) -> str:
     return "fail"
 
 
+def _generate_html_skeleton(settings: Settings, resolved_pipeline_path: Path, project_dir: Path) -> None:
+    """Run build_hyperframes_html.py to generate a structurally correct index.html skeleton."""
+    import subprocess as _subprocess
+    import sys as _sys
+    proc = _subprocess.run(
+        [
+            _sys.executable,
+            str(settings.html_builder_script),
+            "--pipeline",
+            str(resolved_pipeline_path),
+            "--output-dir",
+            str(project_dir),
+        ],
+        cwd=settings.app_root,
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        logger.warning("HTML skeleton script failed (will let LLM author from scratch): %s", proc.stderr or proc.stdout)
+
+
 def build_html_node(state: AgentState, *, settings: Settings, registry: SkillRegistry, model: Any) -> AgentState:
     logger.info("Entering build_html node for session `%s`", state.get("session_id", "unknown"))
     project_dir = Path(state["project_dir"])
@@ -664,10 +912,31 @@ def build_html_node(state: AgentState, *, settings: Settings, registry: SkillReg
     creative_brief_path = Path(state["creative_brief_path"])
     resolved_pipeline = resolved_pipeline_path.read_text(encoding="utf-8")
     creative_brief = creative_brief_path.read_text(encoding="utf-8")
-    skill_context = registry.build_context(state.get("selected_skills", []))
 
-    system_prompt = """
-You are authoring a final HyperFrames HTML composition.
+    # Step A: generate structurally correct skeleton via script (no LLM tokens)
+    _generate_html_skeleton(settings, resolved_pipeline_path, project_dir)
+    skeleton_exists = (project_dir / "index.html").exists()
+    logger.info("HTML skeleton generated=%s for session `%s`", skeleton_exists, state.get("session_id", "unknown"))
+
+    # Step B: LLM enhances style/animation only — use slim context to save tokens
+    slim_context, ref_paths = registry.build_slim_context(state.get("selected_skills", []))
+
+    skeleton_note = (
+        "A structurally correct `index.html` skeleton has already been generated for you by the build script. "
+        "Read it first, then enhance the visual design: improve CSS styling, add premium transitions, enrich GSAP animations, and ensure text is bold and readable. "
+        "Do NOT restructure the HyperFrames scene/clip skeleton — preserve the existing `clip` class, `data-start`, `data-duration`, `data-track-index` attributes, and media element placement."
+        if skeleton_exists else
+        "No skeleton was pre-generated. Author the complete index.html from scratch following HyperFrames conventions."
+    )
+
+    ref_paths_note = ""
+    if ref_paths:
+        ref_paths_note = "Available skill reference documents (use read_file to load any you need):\n" + "\n".join(ref_paths)
+
+    system_prompt = f"""
+You are enhancing a HyperFrames HTML composition.
+
+{skeleton_note}
 
 You may use tools:
 - `list_dir` to discover project and support files
@@ -676,22 +945,19 @@ You may use tools:
 - `patch_file` for focused edits to existing files
 - `run_script` to run whitelisted pipeline scripts and use their output
 
-Rules:
-- Final answer should be the final HTML only if you are not already writing it via write_file
-- Prefer reading exact files instead of guessing content
-- Only write files inside the project directory
-- Final `index.html` must be deterministic and HyperFrames-compatible
-- Render the resolved scene text faithfully. If the pipeline provides non-empty `kicker`, `title`, `body`, `points`, price copy, or CTA copy, do not silently omit it.
-- Ensure the composition stays visually populated from time 0 until the final frame. Do not leave the tail of the composition without a visible media clip.
-- Avoid coverage bugs: do not let earlier full-frame media or overlays remain above later scenes because of incorrect positioning, clip usage, or z-index.
-- Favor clean premium ad direction over flashy but cheap-looking effects.
-- Prioritize text clarity and product readability over aggressive visual treatment.
-- Prefer scene-local composition: each timed scene container should usually contain its own media node, overlay, and text layer together, instead of splitting media and text into separate top-level full-screen tracks unless there is a strong reason.
-- Default to scene-local composition for both image scenes and video scenes. Do not use separate top-level full-screen media tracks as the main pattern for normal ads.
-- Video playback must be runtime-timed, not page-load-timed. Author the structure so each video becomes visible and is heard only during its scheduled scene window.
-- Treat the injected skill references as authoritative implementation guidance.
-- Prefer patterns, structure, and constraints from the injected skill references over your own ad hoc HTML patterns.
-- If a skill reference provides a concrete rule or pattern, follow it unless it conflicts with an explicit hard constraint in this prompt.
+Core rules (strictly enforced — do not override these during enhancement):
+- Preserve every `clip` class, `data-start`, `data-duration`, `data-track-index` attribute already in the skeleton — do NOT remove or change them.
+- `<video>` elements inside a timed `<section>` are plain visual fills — they have NO `data-start`/`data-duration`/`data-track-index` and NO `clip` class. Do NOT add timing attributes to them. Adding data-start to a nested video causes `video_nested_in_timed_element` lint error and freezes the video in renders.
+- Do NOT set `data-has-audio="true"` on any `<video>` element. All videos are `muted`; set `data-has-audio="false"` if the attribute must be present.
+- Audible scenes use separate timed `<audio>` elements with their own `data-start`/`data-duration`/`data-track-index`.
+- Do NOT call `play()`, `pause()`, or set `currentTime` in JS.
+- Do NOT use `Date`, `Math.random()`, or runtime-generated IDs.
+- Do NOT animate `visibility`, `display`, or `autoAlpha` on `clip` elements.
+- Register the paused GSAP timeline on `window.__timelines`.
+- CRITICAL — text animation rule: NEVER use `gsap.from(selector, {{opacity:0, ...}})` on readable text (kicker, title, h1, h2, p, li, .copy, .points, .body, .headline, .subtitle, .cta). `from` with opacity:0 leaves text invisible when the timeline is paused. ALWAYS use `gsap.fromTo(selector, {{opacity:0, ...}}, {{opacity:1, ...}})` if a fade-in is needed, or animate only positional properties (y, x, scale) without touching opacity.
+- Readable text CSS must NOT have `opacity:0` as its resting state.
+- Use only exact `./assets/...` paths from the resolved pipeline.
+- Favor premium ad direction: bold typography, clean layering, intentional transitions.
 """
 
     prompt = f"""
@@ -702,16 +968,10 @@ Primary files:
 - {resolved_pipeline_path}
 - {creative_brief_path}
 
-You should usually write the final result to `index.html`.
+{ref_paths_note}
 
-Use these skill references:
-{skill_context}
-
-Use the skill references fully, not superficially:
-- Read and apply the relevant structural rules, runtime conventions, and media patterns from the injected skill context.
-- Prefer the skill-provided HyperFrames patterns before inventing your own structure.
-- If the skill context is relevant but incomplete, extend it minimally instead of replacing it with a custom approach.
-- If the skill context contains an "Referenced Documents (Auto-loaded)" section, treat it as part of the skill and follow it.
+Skill references (core patterns only — load reference docs above as needed):
+{slim_context}
 
 User request:
 {state["user_request"]}
@@ -725,79 +985,46 @@ Creative brief:
 Resolved pipeline:
 {resolved_pipeline}
 
-Requirements:
-- Output only final HTML
-- Use HyperFrames-compatible root composition rules
-- Use local assets only from the resolved pipeline
-- Use only the exact local media files that already exist in the resolved pipeline. Do NOT invent, rename, or guess `./assets/...` file names.
-- For scene visuals, prefer the exact `resolved_asset_path` values from the resolved pipeline. For narration, prefer the exact `resolved_audio_path` values from the resolved pipeline.
-- Include text, transitions, and visual effects
-- Include separate timed `<audio>` elements for narration assets when present in the resolved pipeline
-- Ensure every scene has audible content. Image scenes should usually use TTS narration; video scenes without TTS should still expose the video's native sound through a separate timed `<audio>` element sourced from the same local media or an extracted local audio file.
-- Register paused GSAP timeline on window.__timelines
-- Keep the output deterministic
-- Use relative paths starting with `./assets/` for all media resources (e.g. `./assets/video.mp4`)
-- Every scene should show readable visible text for a meaningful portion of the scene unless the user explicitly asked for a text-free visual beat.
-- Text layers must be clearly visible above media: use reliable contrast, explicit layering, and avoid placing text behind media.
-- Do not drop or hide important planned copy such as product names, selling points, prices, CTAs, scene titles, or body copy.
-- Typography should be bold, large, and high-contrast enough to stay clear after video rendering on mobile screens.
-- Avoid thin text, low-contrast text, over-blurred text containers, or text sitting on busy image regions without protection.
-- Do NOT leave readable text permanently hidden by default CSS. If text starts hidden for animation, you MUST deterministically reveal it to visible state during its active scene window.
-- Do NOT combine default CSS `opacity:0` on readable text with `gsap.from(... opacity:0 ...)`; that pattern keeps text invisible in the final render.
-- Prefer visible default text styles plus entrance motion, or use explicit `gsap.fromTo(..., {{ opacity: 0 }}, {{ opacity: 1, ... }})` / `gsap.to(..., {{ opacity: 1, ... }})` when starting hidden is intentional.
-- Every scene must have a visible visual asset covering the full scene duration. Do not leave any scene visually empty.
-- The final scene's media must remain visible until the composition end time; do not create an empty last 3-5 seconds.
-- Prefer simple, robust layering over clever but fragile structures.
-- Make scene handoffs robust: later timed scenes and their media must not be hidden behind earlier full-frame elements.
-- Make transitions feel premium and intentional. Avoid building the whole piece with only plain fades or basic slide-ins.
-- Prefer richer transition construction such as layered wipes, masked reveals, push transitions with parallax, blur/dissolve bridges, split-panel moves, flash accents, or typography-led handoffs when appropriate.
-- For most scene changes, combine at least one main transition move with one supporting detail such as scale drift, blur, overlay sweep, text handoff, or directional motion.
-- Avoid visually cheap effects such as white edge bloom, washed-out overlays, excessive glow, overexposure flashes, heavy blur haze, or filters that make product edges look milky.
-- Keep product edges clean and colors believable. Prefer tasteful contrast, shadow, mask, and motion treatment over whitening or bloom-like effects.
-- Prefer one self-contained scene block pattern per scene: a timed scene container with the visual media inside it, then an overlay, then the text/content wrapper above that media.
-- Avoid a fragile structure where image/video clips live as separate top-level full-screen siblings while text scenes live in different top-level timed siblings. That pattern is prone to text disappearing and tail black-screen issues.
-- Scene text should live inside the same timed scene container as its visual asset unless a skill reference explicitly requires another pattern.
-- Final-scene media must be visible by default for its whole scene duration. Do not make the final visual depend solely on a reveal tween such as `clipPath`, mask growth, or a one-off GSAP entrance with no visible fallback state.
-- Video scenes must still show their video by default during the scheduled scene interval. Do not initialize the whole scene or the video in a permanently hidden state such as inline `opacity:0` unless the timeline also deterministically restores and preserves visibility for the full intended playback window.
-- HARD CONSTRAINT: Every timed scene container MUST include the `clip` class (for example: `<div class="scene clip" data-start="..." data-duration="...">`).
-- HARD CONSTRAINT: For normal image/video ad scenes, place the scene's primary `<img>` or `<video>` inside that same timed scene container. Do NOT put all media as separate top-level full-screen siblings and all text as separate scene siblings.
-- HARD CONSTRAINT: Every timed image/video/audio node should itself also include the `clip` class so the runtime consistently treats it as a timed clip.
-- HARD CONSTRAINT: Timed media nodes must be explicitly positioned to fill the composition area; do NOT rely on normal document flow layout for timed media.
-- HARD CONSTRAINT: Scene text overlays must have a higher visual layer than the underlying media, using explicit CSS positioning and z-order.
-- HARD CONSTRAINT: Do NOT leave earlier media visible above later clips because of missing absolute positioning, missing `clip`, or incorrect stacking order.
-- HARD CONSTRAINT: Do NOT rely on track index alone for text visibility or scene layering. Use explicit DOM structure and CSS layering inside each scene.
-- HARD CONSTRAINT: Readable text must not remain at CSS `opacity:0` unless the generated timeline deterministically restores it to visible state for the intended on-screen window.
-- HARD CONSTRAINT: Do NOT use the broken combination of CSS-hidden text plus `gsap.from(... opacity:0 ...)` for the same text reveal. Use visible default text or explicit `fromTo` / `to` to `opacity:1`.
-- HARD CONSTRAINT: Image assets MUST use normal `<img>` elements with local `./assets/...` paths.
-- HARD CONSTRAINT: Video assets MUST use normal `<video>` elements with local `./assets/...` paths, and every video element MUST include `muted playsinline`.
-- HARD CONSTRAINT: Because video elements remain `muted`, any scene that should be audible must have a separate timed `<audio>` element. For video scenes without narration TTS, use the same local video file as the `<audio src>` when appropriate, or another local extracted audio track.
-- HARD CONSTRAINT: Every video asset MUST be represented as a timed media node with its own `data-start`, `data-duration`, and `data-track-index` so the HyperFrames runtime can control playback by timeline time.
-- HARD CONSTRAINT: Do NOT rely on page-load playback for videos. Videos must be positioned so they become visible at the right scene time while playback remains runtime-controlled.
-- HARD CONSTRAINT: Do NOT make video playback depend on page-load autoplay, browser autoplay timing, or an always-running background video. Videos must effectively start being seen/heard at their scheduled `data-start`.
-- HARD CONSTRAINT: Do NOT nest a playing `<video>` as an untimed background inside a separately timed scene pattern that assumes the browser starts playback on load. Use the video itself as the timed clip, or place it inside a non-timed wrapper while timing is carried by the media node.
-- HARD CONSTRAINT: Do NOT add a global background-music `<audio>` element, and do NOT use `<audio src="...mp4">`.
-- HARD CONSTRAINT: Scene narration audio should use normal timed `<audio>` elements with local `./assets/...` paths and their own `data-start`, `data-duration`, and `data-track-index`.
-- HARD CONSTRAINT: Do NOT animate `visibility`/`display`/`autoAlpha` on any element that has the `clip` class (scene containers and timed media). The HyperFrames runtime manages clip visibility; only animate child layers inside a clip.
-- HARD CONSTRAINT: Do NOT set `data-has-audio="true"` on any `<video>` element that is `muted`. If a scene must be audible, use a separate timed `<audio>` element.
-- HARD CONSTRAINT: Do NOT call `play()`, `pause()`, or force media sync by repeatedly setting `currentTime` inside GSAP `onUpdate`. The runtime owns media playback.
-- HARD CONSTRAINT: Do NOT use non-deterministic code such as `Date`, `new Date()`, `Math.random()`, timers that change output across runs, or runtime-generated IDs.
-- HARD CONSTRAINT: Prefer `loop` for short visual video backgrounds when needed. Do NOT add `autoplay` or custom `video.play()` bootstrap code in the generated HTML.
-- HARD CONSTRAINT: If audio is intentionally needed, it must be a separate timed `<audio>` element. Otherwise keep videos muted and visual-only.
+Your task:
+1. Read the current `index.html` (if it exists from the skeleton generator).
+2. Enhance its visual design: improve CSS layout, typography, color, overlay contrast, and GSAP animations.
+3. Add premium transitions between scenes (wipes, masked reveals, parallax pushes, blur dissolves).
+4. Ensure every scene has readable, high-contrast text that is visible by default.
+5. Write the final enhanced HTML back to `index.html`.
+
+Do NOT restructure the clip/scene skeleton. Patch or replace style and animation sections only.
 """
     session_stats = normalize_session_stats(state.get("session_stats"))
-    html = run_file_tool_authoring_loop(
-        model=model,
-        system_prompt=system_prompt,
-        user_prompt=prompt,
-        base_dir=project_dir,
-        readable_roots=[project_dir, resolved_pipeline_path.parent, settings.repo_root, *settings.skills_dirs],
-        allowed_scripts=[settings.media_pipeline_script, settings.html_builder_script],
-        max_tool_call_steps=settings.max_tool_call_steps,
-        session_stats=session_stats,
-    )
     index_path = project_dir / "index.html"
+    try:
+        html = run_file_tool_authoring_loop(
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            base_dir=project_dir,
+            readable_roots=[project_dir, resolved_pipeline_path.parent, settings.repo_root, *settings.skills_dirs],
+            allowed_scripts=[settings.media_pipeline_script, settings.html_builder_script],
+            max_tool_call_steps=settings.max_tool_call_steps,
+            session_stats=session_stats,
+        )
+    except Exception:
+        if not skeleton_exists or not index_path.exists():
+            raise
+        logger.exception(
+            "HTML enhancement via tool-calling failed for session `%s`; retrying with direct HTML fallback",
+            state.get("session_id", "unknown"),
+        )
+        html = run_direct_html_authoring_loop(
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            current_html=index_path.read_text(encoding="utf-8"),
+            session_stats=session_stats,
+        )
+
     if not index_path.exists() or html:
-        index_path.write_text(html.strip() + "\n", encoding="utf-8")
+        fixed_html = auto_fix_html_violations(html.strip())
+        index_path.write_text(fixed_html + "\n", encoding="utf-8")
     logger.info("HTML authored for session `%s` at `%s`", state.get("session_id", "unknown"), index_path)
     meta_path = project_dir / "meta.json"
     if not meta_path.exists():
@@ -829,6 +1056,11 @@ def validate_html_node(state: AgentState, *, settings: Settings) -> AgentState:
             "validate_output": f"error: invalid html output: {exc}",
         }
     html_text = index_path.read_text(encoding="utf-8")
+    logger.debug(
+        "Validate HTML snapshot for session `%s`\n%s",
+        state.get("session_id", "unknown"),
+        _serialize_for_log(describe_html_snapshot(index_path, html_text)),
+    )
     text_visibility_risks = detect_text_visibility_risks(html_text)
     missing_asset_risks = detect_missing_local_asset_refs(html_text, project_dir)
     try:
@@ -849,8 +1081,17 @@ def validate_html_node(state: AgentState, *, settings: Settings) -> AgentState:
         validate_output = f"validate error: {exc}"
         logger.exception("Validate command failed for session `%s`", state.get("session_id", "unknown"))
     if text_visibility_risks:
-        risk_output = "\n".join(f"error: {risk}" for risk in text_visibility_risks)
-        validate_output = ((validate_output.rstrip() + "\n") if validate_output.strip() else "") + risk_output
+        # Only CSS resting-state opacity:0 is a hard error (text guaranteed invisible).
+        # GSAP from(opacity:0) on text is a warning — it animates correctly during playback
+        # but text is invisible while timeline is paused (not fatal for video renders).
+        hard_risks = [r for r in text_visibility_risks if "css" in r.lower() or "resting" in r.lower() or ("opacity:0" in r and "gsap" not in r.lower())]
+        soft_risks = [r for r in text_visibility_risks if r not in hard_risks]
+        if hard_risks:
+            risk_output = "\n".join(f"error: {risk}" for risk in hard_risks)
+            validate_output = ((validate_output.rstrip() + "\n") if validate_output.strip() else "") + risk_output
+        if soft_risks:
+            risk_output = "\n".join(f"warning: {risk}" for risk in soft_risks)
+            validate_output = ((validate_output.rstrip() + "\n") if validate_output.strip() else "") + risk_output
     if missing_asset_risks:
         risk_output = "\n".join(f"error: {risk}" for risk in missing_asset_risks)
         validate_output = ((validate_output.rstrip() + "\n") if validate_output.strip() else "") + risk_output
@@ -890,7 +1131,14 @@ def validate_router(state: AgentState) -> str:
 def repair_html_node(state: AgentState, *, settings: Settings, registry: SkillRegistry, model: Any) -> AgentState:
     logger.info("Entering repair_html node for session `%s`", state.get("session_id", "unknown"))
     project_dir = Path(state["project_dir"])
-    skill_context = registry.build_context(["hyperframes", "gsap"])
+    slim_context, ref_paths = registry.build_slim_context(["hyperframes", "gsap"])
+    ref_paths_note = ""
+    if ref_paths:
+        ref_paths_note = "Available skill reference documents (use read_file to load any you need):\n" + "\n".join(ref_paths)
+    feedback_history = state.get("feedback_history", [])
+    feedback_note = ""
+    if feedback_history:
+        feedback_note = f"\nUser feedback to address during repair:\n{json.dumps(feedback_history, ensure_ascii=False)}\n"
     system_prompt = """
 You are repairing a HyperFrames project.
 
@@ -901,27 +1149,21 @@ You may use:
 - `patch_file` for precise edits to the current HTML or helper files
 - `run_script` to run whitelisted pipeline scripts and use their output
 
-Prefer fixing `index.html` in place.
+Prefer fixing `index.html` in place with patch_file.
 Return final HTML only if you are not already writing it with write_file.
-- Treat the injected skill references as authoritative repair guidance.
-- Prefer repairing toward the skill-provided HyperFrames patterns instead of inventing a new structure.
-- Before making edits, inspect the current `index.html` and use the provided lint/validate outputs as concrete failure evidence.
-- Fix the HTML to satisfy these hard constraints:
+Hard constraints to enforce:
 - Every timed scene container MUST include the `clip` class.
-- Keep image assets as normal `<img>` elements and video assets as normal timed `<video>` elements with `muted playsinline`, `data-start`, `data-duration`, and `data-track-index`.
-- Keep narration as separate timed `<audio>` elements with local `./assets/...` paths and their own `data-start`, `data-duration`, and `data-track-index`.
-- Repair any scene where a video depends on page-load playback instead of runtime-controlled timed playback.
-- Prefer the video element itself to carry media timing; do not leave the video as an untimed background that starts independently of the scene schedule.
-- Remove any global background-music `<audio>` element (especially `<audio src="...mp4">`).
-- Remove any GSAP/media logic that calls `play()`, `pause()`, or repeatedly sets `currentTime`.
-- Remove any non-deterministic code such as `Date`, `new Date()`, `Math.random()`, or runtime-generated IDs.
-- Do NOT add `autoplay` or custom `video.play()` bootstrap code during repair unless the user explicitly asks for that behavior.
-- Keep `<video>` muted unless the project intentionally introduces a separate timed audio track.
-- Do NOT set `data-has-audio="true"` on muted `<video>` elements. If a scene must be audible, add a separate timed `<audio>` element instead.
-- Do NOT animate `visibility`/`display`/`autoAlpha` on any `clip` element (scene containers and timed media). The runtime owns clip visibility; only animate inner layers.
-- Do NOT invent or rename local asset paths during repair. If lint/validate reports a missing `src`, fix the HTML by aligning it to the exact existing `resolved_asset_path` / `resolved_audio_path` from the resolved pipeline.
-- Repair any hidden-text bug where readable copy stays at CSS `opacity:0` or where CSS-hidden text is paired with `gsap.from(... opacity:0 ...)`.
-- Prefer visible default text plus motion, or explicit `fromTo` / `to` tweens that end at `opacity:1`.
+- Keep image assets as `<img>` and keep video assets as timed `<video class="clip" muted playsinline>` elements with local `./assets/...` paths.
+- If a scene contains a visual `<video>`, ensure that the video has `data-start`/`data-duration`/`data-track-index` aligned with its parent scene timing.
+- Keep narration as separate timed `<audio>` elements with local `./assets/...` paths and their own timing attributes.
+- Remove `data-has-audio="true"` from any `<video>` element — all videos are muted.
+- Remove any global background-music `<audio>` and any `<audio src="...mp4">`.
+- Remove GSAP/media logic that calls `play()`, `pause()`, or repeatedly sets `currentTime`.
+- Remove non-deterministic code: `Date`, `new Date()`, `Math.random()`, runtime-generated IDs.
+- Do NOT animate `visibility`/`display`/`autoAlpha` on `clip` elements.
+- Do NOT invent or rename local asset paths.
+- CRITICAL — text animation: Replace every `gsap.from(textSelector, {{opacity:0, ...}})` on readable text (kicker, title, h1, h2, p, li, .copy, .points) with `gsap.fromTo(textSelector, {{opacity:0, ...}}, {{opacity:1, ...}})` so the text has a clear visible end state. Alternatively, remove opacity from the from() call and animate only positional/scale properties.
+- Ensure readable text CSS does NOT have `opacity:0` as its resting state.
 """
     prompt = f"""
 Project directory:
@@ -929,14 +1171,11 @@ Project directory:
 
 Repair this HyperFrames HTML.
 
-Skill references:
-{skill_context}
+{ref_paths_note}
 
-Use the skill references fully during repair:
-- Compare the current HTML against the injected skill patterns and repair toward those patterns first.
-- Prefer minimal fixes that move the HTML closer to the skill-provided HyperFrames conventions.
-- If the skill context contains an "Referenced Documents (Auto-loaded)" section, treat it as part of the skill and follow it.
-
+Skill references (core patterns):
+{slim_context}
+{feedback_note}
 Lint output:
 {state.get("lint_output", "")}
 
@@ -963,7 +1202,8 @@ Treat `timed_element_missing_clip_class` as a real issue that must be fixed, not
 
     index_path = project_dir / "index.html"
     if not index_path.exists() or html:
-        index_path.write_text(html.strip() + "\n", encoding="utf-8")
+        fixed_html = auto_fix_html_violations(html.strip())
+        index_path.write_text(fixed_html + "\n", encoding="utf-8")
     logger.info("HTML repaired for session `%s` at `%s`", state.get("session_id", "unknown"), index_path)
     return {"html_revision_count": state.get("html_revision_count", 0) + 1, "session_stats": session_stats}
 

@@ -46,6 +46,8 @@ def run_hyperframes_command(
             command,
             cwd=settings.repo_root,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             check=check,
             timeout=timeout_seconds or settings.hyperframes_command_timeout_seconds,

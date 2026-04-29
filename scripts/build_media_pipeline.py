@@ -147,6 +147,102 @@ def download_file(url: str, output_path: Path) -> None:
                 file_obj.write(chunk)
 
 
+def has_audio_stream(media_path: Path) -> bool:
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(media_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return bool((probe.stdout or "").strip())
+    except Exception:
+        return False
+
+
+def extracted_audio_target_for_video(video_path: Path) -> Path:
+    return video_path.with_name(f"{video_path.stem}.audio.mp3")
+
+
+def silent_video_target_for_video(video_path: Path) -> Path:
+    return video_path.with_name(f"{video_path.stem}.silent{video_path.suffix.lower()}")
+
+
+def extract_audio_from_video(video_path: Path) -> Path | None:
+    if not video_path.exists() or not has_audio_stream(video_path):
+        return None
+
+    audio_path = extracted_audio_target_for_video(video_path)
+    if audio_path.exists():
+        return audio_path
+
+    ensure_parent(audio_path)
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-acodec",
+            "libmp3lame",
+            "-q:a",
+            "2",
+            str(audio_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        details = ((result.stderr or "") or (result.stdout or "")).strip()[:1200]
+        raise RuntimeError(f"Failed to extract audio from video {video_path.name}: {details}")
+    return audio_path
+
+
+def strip_audio_from_video(video_path: Path) -> Path:
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video not found for strip-audio: {video_path}")
+    if not has_audio_stream(video_path):
+        return video_path
+
+    silent_path = silent_video_target_for_video(video_path)
+    if silent_path.exists():
+        return silent_path
+
+    ensure_parent(silent_path)
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-c:v",
+            "copy",
+            "-an",
+            str(silent_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        details = ((result.stderr or "") or (result.stdout or "")).strip()[:1200]
+        raise RuntimeError(f"Failed to create silent video {silent_path.name}: {details}")
+    return silent_path
+
+
 def normalize_image_ref(value: str, base_dir: Path) -> str:
     file_path = resolve_local_path(value, base_dir)
     if file_path is not None:
@@ -337,10 +433,12 @@ def extract_video_url(task_result: dict[str, Any]) -> str:
     raise RuntimeError(f"Could not find video URL in task result: {json.dumps(task_result)}")
 
 
-def generate_video(asset: dict[str, Any], provider: dict[str, Any], output_root: Path, base_dir: Path) -> Path:
+def generate_video(asset: dict[str, Any], provider: dict[str, Any], output_root: Path, base_dir: Path) -> tuple[Path, Path | None, Path]:
     target = output_root / asset["target"]
     if target.exists():
-        return target
+        extracted_audio = extract_audio_from_video(target)
+        resolved_video = strip_audio_from_video(target)
+        return resolved_video, extracted_audio, target
 
     headers = {
         "Content-Type": "application/json",
@@ -374,7 +472,9 @@ def generate_video(asset: dict[str, Any], provider: dict[str, Any], output_root:
     result = poll_video_task(provider, task_id)
     video_url = extract_video_url(result)
     download_file(video_url, target)
-    return target
+    extracted_audio = extract_audio_from_video(target)
+    resolved_video = strip_audio_from_video(target)
+    return resolved_video, extracted_audio, target
 
 
 def ensure_tts_credentials(provider: dict[str, Any]) -> None:
@@ -510,16 +610,23 @@ def resolve_single_asset(
     desc = asset.get("description") or asset.get("id", "")
     print(f"[PROGRESS] Generating asset {idx}/{total}: {desc} ({asset_type})")
     duration: float | None = None
+    extracted_audio: Path | None = None
+    original_video: Path | None = None
     if asset_type == "image":
         generated = generate_image(asset, providers["image"], output_root, base_dir)
     elif asset_type == "video":
-        generated = generate_video(asset, providers["video"], output_root, base_dir)
+        generated, extracted_audio, original_video = generate_video(asset, providers["video"], output_root, base_dir)
     elif asset_type == "audio":
         generated, duration = generate_audio(asset, providers["audio"], output_root)
     else:
         raise ValueError(f"Unsupported asset type: {asset_type}")
     print(f"[PROGRESS] Asset {idx}/{total} done: {desc}")
-    return asset["id"], {"resolved_path": generated.relative_to(output_root).as_posix(), "duration": duration}
+    payload = {"resolved_path": generated.relative_to(output_root).as_posix(), "duration": duration}
+    if extracted_audio is not None:
+        payload["extracted_audio_path"] = extracted_audio.relative_to(output_root).as_posix()
+    if original_video is not None:
+        payload["source_video_path"] = original_video.relative_to(output_root).as_posix()
+    return asset["id"], payload
 
 
 def resolve_assets(pipeline: dict[str, Any], output_root: Path, base_dir: Path) -> dict[str, dict[str, Any]]:
@@ -590,18 +697,24 @@ def build_resolved_pipeline(pipeline: dict[str, Any], resolved_assets: dict[str,
         asset["resolved"] = bool(asset.get("resolved_path"))
         if resolved.get("duration") is not None:
             asset["resolved_duration"] = round(float(resolved["duration"]), 3)
+        if resolved.get("extracted_audio_path"):
+            asset["extracted_audio_path"] = resolved["extracted_audio_path"]
+        if resolved.get("source_video_path"):
+            asset["source_video_path"] = resolved["source_video_path"]
 
     for scene in resolved_pipeline.get("scenes", []):
         asset_id = scene.get("asset_id")
         audio_asset_id = scene.get("audio_asset_id")
         visual_asset = asset_index.get(asset_id) if asset_id else None
+        extracted_audio_path = visual_asset.get("extracted_audio_path", "") if visual_asset else ""
         if visual_asset and visual_asset.get("type") == "video":
             scene["audio_asset_id"] = None
             scene["voiceover_text"] = ""
             audio_asset_id = None
         audio_asset = asset_index.get(audio_asset_id) if audio_asset_id else None
         scene["resolved_asset_path"] = visual_asset.get("resolved_path", "") if visual_asset else ""
-        scene["resolved_audio_path"] = audio_asset.get("resolved_path", "") if audio_asset else ""
+        scene["resolved_audio_path"] = audio_asset.get("resolved_path", "") if audio_asset else extracted_audio_path
+        scene["resolved_audio_source"] = "tts" if audio_asset else ("video_extracted" if extracted_audio_path else "")
         if audio_asset and audio_asset.get("resolved_duration") is not None:
             scene["resolved_audio_duration"] = audio_asset["resolved_duration"]
         if audio_asset and not scene.get("voiceover_text"):
@@ -627,7 +740,7 @@ def write_pipeline_outputs(output_root: Path, resolved_pipeline: dict[str, Any])
     ]
     for asset in resolved_pipeline.get("assets", []):
         brief_lines.append(
-            f"- {asset.get('id')}: type={asset.get('type')}, source={asset.get('asset_source', 'generated')}, path={asset.get('resolved_path', '(missing)')}, duration={asset.get('resolved_duration', asset.get('target_duration', ''))}"
+            f"- {asset.get('id')}: type={asset.get('type')}, source={asset.get('asset_source', 'generated')}, path={asset.get('resolved_path', '(missing)')}, audio_path={asset.get('extracted_audio_path', '')}, duration={asset.get('resolved_duration', asset.get('target_duration', ''))}"
         )
     brief_lines.append("")
     brief_lines.append("## Scenes")

@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import traceback
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -87,12 +88,106 @@ def _update_from_state(session: SessionData, state: AgentState) -> SessionData:
     return session.model_copy(update=update)
 
 
+def _has_existing_resolved_project(session: SessionData) -> bool:
+    if not session.project_dir or not session.resolved_pipeline_path or not session.creative_brief_path:
+        return False
+    return (
+        Path(session.project_dir).exists()
+        and Path(session.resolved_pipeline_path).exists()
+        and Path(session.creative_brief_path).exists()
+    )
+
+
+def _run_html_phase_sync(session_dir: Path, session: SessionData, *, rebuild_html: bool) -> None:
+    state: AgentState = {
+        "session_id": session.session_id,
+        "session_dir": str(session_dir),
+        "user_request": session.user_request,
+        "uploaded_images": session.uploaded_images,
+        "feedback_history": session.feedback_history,
+        "selected_skills": session.selected_skills,
+        "project_dir": session.project_dir,
+        "pipeline_path": session.pipeline_path,
+        "resolved_pipeline_path": session.resolved_pipeline_path,
+        "creative_brief_path": session.creative_brief_path,
+        "render_output_path": session.render_output_path,
+        "session_stats": session.stats,
+        "stage": "executing",
+    }
+
+    session = session.model_copy(update={"stage": "executing", "last_error": ""})
+    existing_index = Path(session.project_dir) / "index.html"
+    has_existing_html = existing_index.exists()
+    use_incremental_repair = rebuild_html and bool(session.feedback_history) and has_existing_html
+
+    if use_incremental_repair:
+        # Feedback on an existing project: repair incrementally rather than full rebuild
+        session = _append_progress(session, "Reusing existing resolved pipeline. Applying incremental repair for feedback.")
+        save_session(session_dir, session)
+        session = _append_progress(session, "Repairing HTML with feedback...")
+        save_session(session_dir, session)
+        state.update(repair_html_node(state, settings=settings, registry=registry, model=model))
+        session = _update_from_state(session, state)
+        save_session(session_dir, session)
+    elif rebuild_html:
+        session = _append_progress(session, "Reusing existing resolved pipeline. Skipping planning and asset generation.")
+        save_session(session_dir, session)
+        session = _append_progress(session, "Authoring HyperFrames HTML...")
+        save_session(session_dir, session)
+        state.update(build_html_node(state, settings=settings, registry=registry, model=model))
+        session = _update_from_state(session, state)
+        save_session(session_dir, session)
+    else:
+        session = _append_progress(session, "Reusing existing resolved pipeline and current HTML.")
+        save_session(session_dir, session)
+
+    session = _append_progress(session, "Validating project...")
+    save_session(session_dir, session)
+    state.update(validate_html_node(state, settings=settings))
+    session = _update_from_state(session, state)
+    save_session(session_dir, session)
+
+    route = validate_router(state)
+    if route == "repair_html":
+        session = _append_progress(session, "Repairing HTML...")
+        save_session(session_dir, session)
+        state.update(repair_html_node(state, settings=settings, registry=registry, model=model))
+        session = _update_from_state(session, state)
+        save_session(session_dir, session)
+        state.update(validate_html_node(state, settings=settings))
+        session = _update_from_state(session, state)
+        save_session(session_dir, session)
+        route = validate_router(state)
+
+    if route == "fail":
+        session = session.model_copy(update={"stage": "failed"})
+        session = _append_progress(session, "Failed validation.")
+        save_session(session_dir, session)
+        return
+
+    session = _append_progress(session, "Rendering final video...")
+    save_session(session_dir, session)
+    session = session.model_copy(update={"stage": "rendering"})
+    save_session(session_dir, session)
+    state.update(render_node(state, settings=settings))
+    session = _update_from_state(session, state)
+    session = session.model_copy(update={"stage": "done"})
+    session = _append_progress(session, f"Render done: {session.render_output_path}")
+    save_session(session_dir, session)
+
+
 def _run_workflow_sync(session_dir: Path, session: SessionData) -> None:
     """
     Runs the planner/executor/verifier/html/validate/render loop synchronously and
     persists progress updates to `session.json` after each stage.
     """
     try:
+        if _has_existing_resolved_project(session):
+            existing_index = Path(session.project_dir) / "index.html"
+            rebuild_html = bool(session.feedback_history) or not existing_index.exists()
+            _run_html_phase_sync(session_dir, session, rebuild_html=rebuild_html)
+            return
+
         state: AgentState = {
             "session_id": session.session_id,
             "session_dir": str(session_dir),

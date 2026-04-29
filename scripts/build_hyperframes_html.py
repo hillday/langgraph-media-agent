@@ -48,13 +48,16 @@ def build_html(pipeline: dict[str, Any]) -> str:
         start = scene["start"]
         duration = scene["duration"]
         visual_path = media_src(resolved_path(pipeline, scene.get("asset_id", "")))
-        visual_asset = find_asset(pipeline, scene.get("asset_id", ""))
-        audio_path = ""
-        if not (visual_asset and visual_asset.get("type") == "video"):
-            audio_path = media_src(resolved_path(pipeline, scene.get("audio_asset_id", "")))
+        audio_path = media_src(str(scene.get("resolved_audio_path", "")))
         visual_html = ""
         if visual_path.endswith((".mp4", ".webm", ".mov")):
-            visual_html = f"""<video id="visual-{idx}" class="clip visual" src="{visual_path}" muted playsinline loop data-start="{start}" data-duration="{duration}" data-track-index="{idx*10}"></video>"""
+            # HyperFrames forbids data-start on a <video> nested inside another timed element
+            # (causes video_nested_in_timed_element lint error and frozen frames in renders).
+            # The parent <section> carries clip timing; the video is a plain visual fill.
+            visual_html = (
+                f"""<video id="visual-{idx}" class="visual" src="{visual_path}" """
+                f"""muted playsinline loop></video>"""
+            )
         elif visual_path:
             visual_html = f"""<img id="visual-{idx}" class="clip visual" src="{visual_path}" data-start="{start}" data-duration="{duration}" data-track-index="{idx*10}" />"""
 
@@ -94,7 +97,7 @@ def build_html(pipeline: dict[str, Any]) -> str:
         start = float(scene["start"])
         scene_id = scene["id"]
         timeline_lines.append(
-            f'tl.from("#{scene_id} .copy", {{ opacity: 0, y: 30, duration: 0.8, ease: "power3.out" }}, {start + 0.2});'
+            f'tl.fromTo("#{scene_id} .copy", {{ opacity: 0, y: 30 }}, {{ opacity: 1, y: 0, duration: 0.8, ease: "power3.out" }}, {start + 0.2});'
         )
 
     timeline = "\n        ".join(timeline_lines)
@@ -113,28 +116,31 @@ def build_html(pipeline: dict[str, Any]) -> str:
         width: {fmt['width']}px;
         height: {fmt['height']}px;
         overflow: hidden;
-        background: #060914;
-        color: #f4f7ff;
+        background: #000;
+        color: #fff;
         font-family: Inter, system-ui, Arial, sans-serif;
       }}
-      #root {{ position: relative; width: {fmt['width']}px; height: {fmt['height']}px; }}
-      .scene {{ position: absolute; inset: 0; }}
-      .visual {{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; opacity:0.45; }}
-      .overlay {{ position:absolute; inset:0; background: linear-gradient(90deg, rgba(5,9,20,0.78), rgba(5,9,20,0.2)); }}
+      #root {{ position: relative; width: {fmt['width']}px; height: {fmt['height']}px; overflow: hidden; }}
+      .scene {{ position: absolute; inset: 0; overflow: hidden; }}
+      .visual {{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }}
+      .overlay {{ position:absolute; inset:0; background: linear-gradient(to top, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.15) 45%, transparent 70%); }}
       .copy {{
-        position:absolute; left:112px; top:120px; width:760px;
-        padding:42px 46px; border-radius:28px;
-        background: rgba(8,14,28,0.58); border:1px solid rgba(255,255,255,0.1);
-        backdrop-filter: blur(14px);
+        position:absolute; left:60px; bottom:100px; right:60px;
+        padding:0;
+        background: none; border: none;
       }}
       .kicker {{
-        display:inline-flex; padding:10px 16px; border-radius:999px;
-        border:1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.06);
-        font-size:22px; margin-bottom:20px;
+        display:inline-block; padding:6px 14px; border-radius:4px;
+        background: rgba(255,255,255,0.15);
+        font-size:18px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase;
+        margin-bottom:14px;
       }}
-      h1 {{ margin:0 0 14px; font-size:88px; line-height:0.94; letter-spacing:-2px; }}
-      p {{ margin:0; font-size:31px; line-height:1.28; color: rgba(244,247,255,0.9); }}
-      .points {{ margin:22px 0 0; padding-left:24px; font-size:22px; line-height:1.4; color: rgba(244,247,255,0.82); }}
+      h1 {{ margin:0 0 12px; font-size:72px; line-height:1.0; letter-spacing:-1.5px; font-weight:800;
+            text-shadow: 0 2px 24px rgba(0,0,0,0.5); }}
+      p {{ margin:0; font-size:26px; line-height:1.35; color: rgba(255,255,255,0.88);
+           text-shadow: 0 1px 12px rgba(0,0,0,0.4); }}
+      .points {{ margin:14px 0 0; padding-left:20px; font-size:22px; line-height:1.5;
+                 color: rgba(255,255,255,0.88); text-shadow: 0 1px 10px rgba(0,0,0,0.4); }}
     </style>
   </head>
   <body>
@@ -147,7 +153,6 @@ def build_html(pipeline: dict[str, Any]) -> str:
       data-height="{fmt['height']}"
     >
 {scenes_html}
-      <script id="generation-spec" type="application/json">{json.dumps(pipeline, ensure_ascii=True)}</script>
       <script>
         window.__timelines = window.__timelines || {{}};
         const tl = gsap.timeline({{ paused: true }});
