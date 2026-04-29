@@ -84,6 +84,29 @@ def summarize_exception(exc: Exception) -> str:
     return str(exc)
 
 
+class VideoTaskFailedError(RuntimeError):
+    def __init__(self, task_id: str, body: dict[str, Any]):
+        self.task_id = task_id
+        self.body = body
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        self.error_code = str(error.get("code", "")).strip()
+        self.error_message = str(error.get("message", "")).strip()
+        super().__init__(f"Video generation failed for task {task_id}: {json.dumps(body, ensure_ascii=False)}")
+
+
+def is_retryable_video_task_failure(exc: Exception) -> bool:
+    if not isinstance(exc, VideoTaskFailedError):
+        return False
+    code = exc.error_code
+    message = exc.error_message.lower()
+    retryable_codes = {
+        "OutputAudioSensitiveContentDetected",
+    }
+    if code in retryable_codes:
+        return True
+    return "sensitive" in message and "audio" in message
+
+
 def request_with_retry(
     method: str,
     url: str,
@@ -412,7 +435,7 @@ def poll_video_task(provider: dict[str, Any], task_id: str) -> dict[str, Any]:
         if status == "succeeded":
             return body
         if status == "failed":
-            raise RuntimeError(f"Video generation failed for task {task_id}: {json.dumps(body)}")
+            raise VideoTaskFailedError(task_id, body)
         time.sleep(5)
 
     raise TimeoutError(f"Video generation timed out for task {task_id}")
@@ -445,36 +468,55 @@ def generate_video(asset: dict[str, Any], provider: dict[str, Any], output_root:
         "Authorization": f"Bearer {ensure_api_key()}",
     }
     payload = create_video_request(asset, provider, base_dir)
-    log_json_event(
-        f"[VIDEO][REQUEST] asset={asset['id']} endpoint={provider['endpoint']}",
-        payload,
-    )
-    response = request_with_retry(
-        "POST",
-        provider["endpoint"],
-        context=f"Video task creation ({asset['id']})",
-        headers=headers,
-        json=payload,
-        timeout=30,
-        attempts=5,
-        backoff_seconds=3.0,
-    )
-    raise_for_status_with_hint(response, f"Video task creation ({asset['id']})")
-    task_info = response.json()
-    log_json_event(
-        f"[VIDEO][RESPONSE] asset={asset['id']} status={response.status_code}",
-        task_info,
-    )
-    task_id = task_info.get("id")
-    if not task_id:
-        raise RuntimeError(f"Video task creation returned no task id: {json.dumps(task_info)}")
+    task_attempts = 3
+    last_error: Exception | None = None
+    for attempt in range(1, task_attempts + 1):
+        log_json_event(
+            f"[VIDEO][REQUEST] asset={asset['id']} attempt={attempt}/{task_attempts} endpoint={provider['endpoint']}",
+            payload,
+        )
+        response = request_with_retry(
+            "POST",
+            provider["endpoint"],
+            context=f"Video task creation ({asset['id']})",
+            headers=headers,
+            json=payload,
+            timeout=30,
+            attempts=5,
+            backoff_seconds=3.0,
+        )
+        raise_for_status_with_hint(response, f"Video task creation ({asset['id']})")
+        task_info = response.json()
+        log_json_event(
+            f"[VIDEO][RESPONSE] asset={asset['id']} attempt={attempt}/{task_attempts} status={response.status_code}",
+            task_info,
+        )
+        task_id = task_info.get("id")
+        if not task_id:
+            raise RuntimeError(f"Video task creation returned no task id: {json.dumps(task_info)}")
 
-    result = poll_video_task(provider, task_id)
-    video_url = extract_video_url(result)
-    download_file(video_url, target)
-    extracted_audio = extract_audio_from_video(target)
-    resolved_video = strip_audio_from_video(target)
-    return resolved_video, extracted_audio, target
+        try:
+            result = poll_video_task(provider, task_id)
+            video_url = extract_video_url(result)
+            download_file(video_url, target)
+            extracted_audio = extract_audio_from_video(target)
+            resolved_video = strip_audio_from_video(target)
+            return resolved_video, extracted_audio, target
+        except Exception as exc:
+            last_error = exc
+            if attempt >= task_attempts or not is_retryable_video_task_failure(exc):
+                raise
+            sleep_seconds = 3.0 * attempt
+            print(
+                f"[RETRY] Video task execution ({asset['id']}) attempt {attempt}/{task_attempts} failed with "
+                f"retryable task error {type(exc).__name__}: {truncate_log_text(str(exc), 300)}, "
+                f"resubmitting in {sleep_seconds:.1f}s"
+            )
+            time.sleep(sleep_seconds)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Video generation failed for asset {asset['id']} without a captured error")
 
 
 def ensure_tts_credentials(provider: dict[str, Any]) -> None:

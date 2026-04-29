@@ -49,17 +49,23 @@ def build_html(pipeline: dict[str, Any]) -> str:
         duration = scene["duration"]
         visual_path = media_src(resolved_path(pipeline, scene.get("asset_id", "")))
         audio_path = media_src(str(scene.get("resolved_audio_path", "")))
+        is_video_scene = visual_path.endswith((".mp4", ".webm", ".mov"))
+        scene_class = "scene clip"
         visual_html = ""
-        if visual_path.endswith((".mp4", ".webm", ".mov")):
-            # HyperFrames forbids data-start on a <video> nested inside another timed element
-            # (causes video_nested_in_timed_element lint error and frozen frames in renders).
-            # The parent <section> carries clip timing; the video is a plain visual fill.
+        if is_video_scene:
+            # Timed videos stay as sibling clips so HyperFrames can own playback
+            # without being hidden by an opaque timed scene wrapper.
             visual_html = (
-                f"""<video id="visual-{idx}" class="visual" src="{visual_path}" """
-                f"""muted playsinline loop></video>"""
+                f"""<video id="visual-{idx}" class="clip visual" src="{visual_path}" """
+                f"""data-start="{start}" data-duration="{duration}" data-track-index="{idx*10}" """
+                f"""data-has-audio="false" muted playsinline loop></video>"""
             )
+            scene_class += " scene-with-external-video"
         elif visual_path:
-            visual_html = f"""<img id="visual-{idx}" class="clip visual" src="{visual_path}" data-start="{start}" data-duration="{duration}" data-track-index="{idx*10}" />"""
+            visual_html = (
+                f"""<img id="visual-{idx}" class="clip visual" src="{visual_path}" """
+                f"""data-start="{start}" data-duration="{duration}" data-track-index="{idx*10}" />"""
+            )
 
         audio_html = ""
         if audio_path:
@@ -76,8 +82,23 @@ def build_html(pipeline: dict[str, Any]) -> str:
             items = "\n".join(f"<li>{p}</li>" for p in points)
             points_html = f"<ul class=\"points\">{items}</ul>"
 
+        if is_video_scene:
+            return f"""
+      {visual_html}
+      <section id="{scene['id']}" class="{scene_class}" data-start="{start}" data-duration="{duration}" data-track-index="{idx*10+2}">
+        {audio_html}
+        <div class="overlay"></div>
+        <div class="copy">
+          <div class="kicker">{kicker}</div>
+          <h1>{scene.get("title","")}</h1>
+          <p>{body}</p>
+          {points_html}
+        </div>
+      </section>
+"""
+
         return f"""
-      <section id="{scene['id']}" class="scene clip" data-start="{start}" data-duration="{duration}" data-track-index="{idx*10+2}">
+      <section id="{scene['id']}" class="{scene_class}" data-start="{start}" data-duration="{duration}" data-track-index="{idx*10+2}">
         {visual_html}
         {audio_html}
         <div class="overlay"></div>
@@ -122,6 +143,7 @@ def build_html(pipeline: dict[str, Any]) -> str:
       }}
       #root {{ position: relative; width: {fmt['width']}px; height: {fmt['height']}px; overflow: hidden; }}
       .scene {{ position: absolute; inset: 0; overflow: hidden; }}
+      .scene-with-external-video {{ background: transparent; }}
       .visual {{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }}
       .overlay {{ position:absolute; inset:0; background: linear-gradient(to top, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.15) 45%, transparent 70%); }}
       .copy {{

@@ -287,49 +287,141 @@ def extract_html_document(text: str) -> str:
 
 def auto_fix_html_violations(html: str) -> str:
     """Deterministically fix known mechanical HyperFrames violations that don't require LLM judgment."""
-    # 1. Remove data-has-audio="true" from any <video> element (all videos are muted).
+    # 1. Videos in this pipeline are always muted visuals; narration is separate <audio>.
+    #    Ensure the contract is explicit and never claims video has audio.
     html = re.sub(
-        r'(<video\b[^>]*?)\s+data-has-audio=(?:"true"|\'true\')([^>]*>)',
-        r'\1\2',
+        r'\bdata-has-audio=(?:"true"|\'true\')',
+        'data-has-audio="false"',
         html,
         flags=re.IGNORECASE,
     )
 
-    # 2. Strip timing attributes from <video> elements nested inside a timed <section>.
-    #    HyperFrames forbids a video with data-start inside another timed element
-    #    (video_nested_in_timed_element → video is FROZEN in renders).
-    #    The parent <section> already carries clip timing; the video is a plain visual fill.
-    def _strip_timing_from_nested_video(section_match: re.Match) -> str:
+    # 2. Normalize scene videos into external timed clips so HyperFrames owns playback
+    #    and the following scene wrapper does not visually cover the video.
+    def _upsert_attr(tag: str, attr: str, value: str) -> str:
+        pattern = rf'\s+{attr}=(?:"[^"]*"|\'[^\']*\')'
+        replacement = f' {attr}="{value}"'
+        if re.search(pattern, tag, re.IGNORECASE):
+            return re.sub(pattern, replacement, tag, count=1, flags=re.IGNORECASE)
+        return tag[:-1] + replacement + ">"
+
+    def _ensure_class(tag: str, class_name: str) -> str:
+        class_match = re.search(r'class=(?:"([^"]*)"|\'([^\']*)\')', tag, re.IGNORECASE)
+        if not class_match:
+            return tag[:-1] + f' class="{class_name}">'
+        existing = class_match.group(1) if class_match.group(1) is not None else class_match.group(2) or ""
+        classes = [part for part in existing.split() if part]
+        if class_name not in classes:
+            classes.append(class_name)
+        quote = '"' if class_match.group(1) is not None else "'"
+        replacement = f'class={quote}{" ".join(classes)}{quote}'
+        return tag[: class_match.start()] + replacement + tag[class_match.end() :]
+
+    def _ensure_bool_attr_on_open_tag(open_tag: str, attr: str) -> str:
+        if re.search(rf"\b{attr}\b", open_tag, re.IGNORECASE):
+            return open_tag
+        return open_tag[:-1] + f" {attr}>"
+
+    def _normalize_video_tag(tag: str, *, start: str, duration: str, visual_track_index: str | None) -> str:
+        open_tag_match = re.search(r"<video\b[^>]*>", tag, re.IGNORECASE | re.DOTALL)
+        if not open_tag_match:
+            return tag
+        open_tag = open_tag_match.group(0)
+        open_tag = re.sub(
+            r'\bdata-has-audio=(?:"true"|\'true\')',
+            'data-has-audio="false"',
+            open_tag,
+            flags=re.IGNORECASE,
+        )
+        open_tag = _ensure_class(open_tag, "clip")
+        open_tag = _upsert_attr(open_tag, "data-start", start)
+        open_tag = _upsert_attr(open_tag, "data-duration", duration)
+        if visual_track_index is not None:
+            open_tag = _upsert_attr(open_tag, "data-track-index", visual_track_index)
+        if not re.search(r"\bdata-has-audio=", open_tag, re.IGNORECASE):
+            open_tag = open_tag[:-1] + ' data-has-audio="false">'
+        open_tag = _ensure_bool_attr_on_open_tag(open_tag, "muted")
+        open_tag = _ensure_bool_attr_on_open_tag(open_tag, "playsinline")
+        return tag[: open_tag_match.start()] + open_tag + tag[open_tag_match.end() :]
+
+    def _normalize_section_video(section_match: re.Match) -> str:
         open_tag = section_match.group(1)
         body = section_match.group(2)
+        start_match = re.search(r'data-start="([^"]*)"', open_tag, re.IGNORECASE)
+        duration_match = re.search(r'data-duration="([^"]*)"', open_tag, re.IGNORECASE)
+        track_match = re.search(r'data-track-index="([^"]*)"', open_tag, re.IGNORECASE)
+        if not start_match or not duration_match:
+            return section_match.group(0)
+        start = start_match.group(1)
+        duration = duration_match.group(1)
+        visual_track_index: str | None = None
+        if track_match:
+            try:
+                visual_track_index = str(max(int(track_match.group(1)) - 2, 0))
+            except ValueError:
+                visual_track_index = None
 
-        def _strip_video(video_match: re.Match) -> str:
-            tag = video_match.group(0)
-            # Only strip timing if this video actually has data-start (i.e., was incorrectly timed)
-            if not re.search(r'\bdata-start=', tag, re.IGNORECASE):
-                return tag
-            tag = re.sub(r'\s+data-start=(?:"[^"]*"|\'[^\']*\')', '', tag, flags=re.IGNORECASE)
-            tag = re.sub(r'\s+data-duration=(?:"[^"]*"|\'[^\']*\')', '', tag, flags=re.IGNORECASE)
-            tag = re.sub(r'\s+data-track-index=(?:"[^"]*"|\'[^\']*\')', '', tag, flags=re.IGNORECASE)
-            # Remove 'clip' from class but preserve other classes
-            tag = re.sub(r'\bclip\s*', '', tag)
-            tag = re.sub(r'class="\s*"', '', tag)
-            return tag
-
-        fixed_body = re.sub(
-            r'<video\b[^>]*>',
-            _strip_video,
+        video_block_match = re.search(
+            r'(<video\b[\s\S]*?</video>)',
             body,
-            flags=re.IGNORECASE | re.DOTALL,
+            re.IGNORECASE,
         )
-        return f"{open_tag}{fixed_body}</section>"
+        if not video_block_match:
+            return section_match.group(0)
+        normalized_video = _normalize_video_tag(
+            video_block_match.group(1),
+            start=start,
+            duration=duration,
+            visual_track_index=visual_track_index,
+        )
+        fixed_body = body[: video_block_match.start()] + body[video_block_match.end() :]
+        fixed_open_tag = _ensure_class(open_tag, "scene-with-external-video")
+        return f"{normalized_video}\n      {fixed_open_tag}{fixed_body}</section>"
 
     html = re.sub(
         r'(<section\b[^>]*\bdata-start=(?:"[^"]*"|\'[^\']*\')[^>]*>)([\s\S]*?)</section>',
-        _strip_timing_from_nested_video,
+        _normalize_section_video,
         html,
         flags=re.IGNORECASE,
     )
+
+    def _normalize_external_video_scene_pair(match: re.Match) -> str:
+        video_block = match.group(1)
+        open_tag = match.group(2)
+        body = match.group(3)
+        start_match = re.search(r'data-start="([^"]*)"', open_tag, re.IGNORECASE)
+        duration_match = re.search(r'data-duration="([^"]*)"', open_tag, re.IGNORECASE)
+        track_match = re.search(r'data-track-index="([^"]*)"', open_tag, re.IGNORECASE)
+        visual_track_index: str | None = None
+        if track_match:
+            try:
+                visual_track_index = str(max(int(track_match.group(1)) - 2, 0))
+            except ValueError:
+                visual_track_index = None
+        if not start_match or not duration_match:
+            return match.group(0)
+        fixed_video = _normalize_video_tag(
+            video_block,
+            start=start_match.group(1),
+            duration=duration_match.group(1),
+            visual_track_index=visual_track_index,
+        )
+        fixed_open_tag = _ensure_class(open_tag, "scene-with-external-video")
+        return f"{fixed_video}\n      {fixed_open_tag}{body}</section>"
+
+    html = re.sub(
+        r'(<video\b[\s\S]*?</video>)\s*(<section\b[^>]*\bdata-start=(?:"[^"]*"|\'[^\']*\')[^>]*>)([\s\S]*?)</section>',
+        _normalize_external_video_scene_pair,
+        html,
+        flags=re.IGNORECASE,
+    )
+
+    if "scene-with-external-video" in html and ".scene-with-external-video" not in html:
+        html = html.replace(
+            "</style>",
+            "\n      .scene-with-external-video { background: transparent !important; }\n    </style>",
+            1,
+        )
 
     return html
 
@@ -947,8 +1039,9 @@ You may use tools:
 
 Core rules (strictly enforced — do not override these during enhancement):
 - Preserve every `clip` class, `data-start`, `data-duration`, `data-track-index` attribute already in the skeleton — do NOT remove or change them.
-- `<video>` elements inside a timed `<section>` are plain visual fills — they have NO `data-start`/`data-duration`/`data-track-index` and NO `clip` class. Do NOT add timing attributes to them. Adding data-start to a nested video causes `video_nested_in_timed_element` lint error and freezes the video in renders.
-- Do NOT set `data-has-audio="true"` on any `<video>` element. All videos are `muted`; set `data-has-audio="false"` if the attribute must be present.
+- `<video>` elements must remain timed `clip` elements with `data-start`/`data-duration`/`data-track-index` so HyperFrames owns playback correctly.
+- If a timed `<video>` is placed immediately before a scene section, preserve that external-sibling layout, keep the scene visually transparent enough for the video to remain visible, and target the video by its own id (for example `#visual-3`) rather than `#scene_3 .visual`.
+- Do NOT set `data-has-audio="true"` on any `<video>` element. All videos are `muted` visuals and should use `data-has-audio="false"`.
 - Audible scenes use separate timed `<audio>` elements with their own `data-start`/`data-duration`/`data-track-index`.
 - Do NOT call `play()`, `pause()`, or set `currentTime` in JS.
 - Do NOT use `Date`, `Math.random()`, or runtime-generated IDs.
@@ -1154,9 +1247,9 @@ Return final HTML only if you are not already writing it with write_file.
 Hard constraints to enforce:
 - Every timed scene container MUST include the `clip` class.
 - Keep image assets as `<img>` and keep video assets as timed `<video class="clip" muted playsinline>` elements with local `./assets/...` paths.
-- If a scene contains a visual `<video>`, ensure that the video has `data-start`/`data-duration`/`data-track-index` aligned with its parent scene timing.
+- If a scene uses a visual `<video>`, keep the timed video clip valid and preserve its external-sibling layout when present; do not hide it behind an opaque scene background, and target the video by its own id instead of descendant selectors that assume nesting.
 - Keep narration as separate timed `<audio>` elements with local `./assets/...` paths and their own timing attributes.
-- Remove `data-has-audio="true"` from any `<video>` element — all videos are muted.
+- Any muted `<video>` must declare `data-has-audio="false"`; never use `data-has-audio="true"` for project videos.
 - Remove any global background-music `<audio>` and any `<audio src="...mp4">`.
 - Remove GSAP/media logic that calls `play()`, `pause()`, or repeatedly sets `currentTime`.
 - Remove non-deterministic code: `Date`, `new Date()`, `Math.random()`, runtime-generated IDs.
